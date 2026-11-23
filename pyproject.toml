@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysubzone"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python API, CLI and TUI to search and download subtitles from subzone.ir (Subf2m subtitle database)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -65,6 +65,9 @@ Issues = "https://github.com/mackeos/PySubZone/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pysubzone = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

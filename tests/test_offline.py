@@ -716,3 +716,400 @@ def test_tui_download_dialog_has_rename_input(tmp_path, config_env):
             assert not app.screen.query_one("#extract", Button).disabled
 
     _run_async(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0: ScoreWeights (configurable scoring)
+# ---------------------------------------------------------------------------
+
+def _match_versions():
+    return [
+        SubtitleVersion(
+            slug="show-season-1", lang="farsi_persian", sub_id="1",
+            releases=["Show.S01E01.1080p.WEB-DL-AAA"], author="a",
+        ),
+        SubtitleVersion(
+            slug="show-season-1", lang="farsi_persian", sub_id="2",
+            releases=["Show.S01E01.720p.WEB-DL-NTb"], author="b",
+        ),
+    ]
+
+
+def test_score_weights_defaults_reproduce_builtin_ranking():
+    from pysubzone.scoring import DEFAULT_WEIGHTS, pick_best
+
+    video = "Show.S01E01.1080p.WEB-DL-NTb"
+    assert pick_best(video, _match_versions()) == pick_best(
+        video, _match_versions(), DEFAULT_WEIGHTS
+    )
+    assert pick_best(video, _match_versions())[1].sub_id == "1"
+
+
+def test_score_weights_change_ranking():
+    from pysubzone.scoring import ScoreWeights, pick_best
+
+    video = "Show.S01E01.1080p.WEB-DL-NTb"
+    weights = ScoreWeights(
+        resolution_match=0,
+        resolution_mismatch=0,
+        resolution_unspecified=0,
+        source_match=20,
+        group_match=100,
+    )
+    picked = pick_best(video, _match_versions(), weights)
+    assert picked[1].sub_id == "2"  # release group now dominates
+
+
+def test_score_weights_season_pack_floor():
+    from pysubzone.scoring import ScoreWeights, score_version
+
+    pack = SubtitleVersion(
+        slug="show-season-1", lang="farsi_persian", sub_id="3",
+        releases=["Show.S01.1080p.WEB-DL"], author="c",
+    )
+    # res 25 + source 20 + group 15 + token overlap 10, no pin/rate bonus
+    assert score_version("Show.S01E01.1080p.WEB-DL", pack) == 70
+    weights = ScoreWeights(season_pack_floor=-1)
+    assert score_version("Show.S01E01.1080p.WEB-DL", pack, weights) >= 0
+
+
+def test_best_for_file_forwards_weights(tmp_path, monkeypatch):
+    from pysubzone.client import SubZoneClient
+    from pysubzone.models import TitleResult
+    from pysubzone.scoring import ScoreWeights
+
+    client = SubZoneClient()
+    seen = {}
+
+    def fake_pick_best(stem, versions, weights=None):
+        seen["weights"] = weights
+        return (10, versions[0])
+
+    monkeypatch.setattr("pysubzone.client.pick_best", fake_pick_best)
+    monkeypatch.setattr(
+        client, "search_exact",
+        lambda query, lang=None: TitleResult(name="Show", slug="show-season-1", url=""),
+    )
+    monkeypatch.setattr(
+        client, "title_versions", lambda slug, lang=None: _match_versions()
+    )
+    client.best_for_file("Show.S01E01.1080p", weights=ScoreWeights(group_match=99))
+    assert seen["weights"].group_match == 99
+    client.best_for_file("Show.S01E01.1080p")
+    assert seen["weights"] is None  # untouched default passes through
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0: rate limiting + page cache
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, url):
+        self.status_code = 200
+        self.text = f"page:{url}"
+
+
+class _FakeSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        return _FakeResp(url)
+
+
+def test_rate_limit_sleeps_between_requests(monkeypatch):
+    import pysubzone.client as client_mod
+    from pysubzone.client import SubZoneClient
+
+    sleeps = []
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: sleeps.append(s))
+    client = SubZoneClient(min_request_interval=0.4)
+    client.session = _FakeSession()
+
+    client._get("/first")
+    assert sleeps == []  # first request is never delayed
+    client._get("/second")
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= 0.4
+
+
+def test_page_cache_hits_session_once():
+    from pysubzone.client import SubZoneClient
+
+    client = SubZoneClient(cache_ttl=60)
+    fake = _FakeSession()
+    client.session = fake
+    r1 = client._get("/subtitles/show")
+    r2 = client._get("/subtitles/show")
+    assert len(fake.calls) == 1
+    assert r1 is r2 and r1.text == "page:https://subzone.ir/subtitles/show"
+    client._get("/subtitles/show", params={"query": "x"})
+    assert len(fake.calls) == 2  # different query -> different cache key
+
+
+def test_page_cache_expires_after_ttl(monkeypatch):
+    import pysubzone.client as client_mod
+    from pysubzone.client import SubZoneClient
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(client_mod.time, "monotonic", lambda: clock["t"])
+    client = SubZoneClient(cache_ttl=10)
+    fake = _FakeSession()
+    client.session = fake
+
+    client._get("/a")
+    clock["t"] += 5
+    client._get("/a")
+    assert len(fake.calls) == 1  # still fresh
+    clock["t"] += 6  # 11s > ttl of 10s
+    client._get("/a")
+    assert len(fake.calls) == 2  # expired -> refetched
+
+
+def test_cache_never_caches_stream_downloads():
+    from pysubzone.client import SubZoneClient
+
+    client = SubZoneClient(cache_ttl=60)
+    fake = _FakeSession()
+    client.session = fake
+    client._get("/download", stream=True)
+    client._get("/download", stream=True)
+    assert len(fake.calls) == 2
+
+
+def test_clear_cache_forces_refetch():
+    from pysubzone.client import SubZoneClient
+
+    client = SubZoneClient(cache_ttl=60)
+    fake = _FakeSession()
+    client.session = fake
+    client._get("/a")
+    client.clear_cache()
+    client._get("/a")
+    assert len(fake.calls) == 2
+
+
+def test_parse_ref_raises_invalid_url_error():
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import InvalidURLError
+
+    with pytest.raises(InvalidURLError):
+        SubZoneClient._parse_ref("not-a-ref")
+    with pytest.raises(InvalidURLError):
+        SubZoneClient._parse_ref("slug/lang/notanumber")
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0: py.typed + async client
+# ---------------------------------------------------------------------------
+
+def test_py_typed_marker_ships():
+    import pysubzone
+
+    assert (Path(pysubzone.__file__).parent / "py.typed").is_file()
+
+
+def test_async_client_delegates_to_sync_client():
+    import asyncio
+
+    from pysubzone.async_client import AsyncSubZoneClient
+
+    async def scenario():
+        client = AsyncSubZoneClient()
+        calls = []
+        client._client.search = (
+            lambda query, lang=None: calls.append(("search", query, lang)) or ["r"]
+        )
+        client._client.best_for_file = (
+            lambda stem, lang=None, title_query=None, weights=None:
+            calls.append(("bff", stem, lang)) or ("t", "v", 1)
+        )
+        client._client.download = (
+            lambda *a, **k: calls.append(("dl", a[0], a[1])) or "dl-ok"
+        )
+        assert await client.search("dexter", lang="fa") == ["r"]
+        assert await client.best_for_file("Show.S01E01") == ("t", "v", 1)
+        assert await client.download("a/b/1", dest_dir="/tmp/x") == "dl-ok"
+        await client.close()
+        return calls
+
+    calls = asyncio.run(scenario())
+    assert ("search", "dexter", "fa") in calls
+    assert ("bff", "Show.S01E01", "farsi_persian") in calls
+    assert ("dl", "a/b/1", "/tmp/x") in calls
+
+
+def test_async_client_context_manager():
+    import asyncio
+
+    from pysubzone.async_client import AsyncSubZoneClient
+
+    async def scenario():
+        async with AsyncSubZoneClient(cache_ttl=5) as client:
+            assert client.sync.cache_ttl == 5
+            assert client.sync.min_request_interval == 0
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 0.4.0: CLI languages / title / --map-json / network options
+# ---------------------------------------------------------------------------
+
+def test_cli_languages_lists_known_languages(config_env):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    result = _runner().invoke(app, ["languages"])
+    assert result.exit_code == 0, result.output
+    assert "farsi_persian" in result.output
+    assert "Farsi/Persian" in result.output
+    assert "fa" in result.output
+
+    result = _runner().invoke(app, ["languages", "--json"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    fa = next(row for row in data if row["slug"] == "farsi_persian")
+    assert fa["name"] == "Farsi/Persian" and "fa" in fa["codes"]
+    assert len(data) > 50
+
+
+def test_cli_title_shows_language_tabs(config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+    from pysubzone.models import TitlePage
+
+    class _StubClient:
+        base_url = "https://subzone.ir"
+
+        def title(self, slug):
+            return TitlePage(
+                slug="show-season-1", name="Show", year=2024, imdb_id="tt1234567",
+                languages=[
+                    {"slug": "farsi_persian", "count": 12, "url": "/x"},
+                    {"slug": "english", "count": 40, "url": "/y"},
+                ],
+                versions=[
+                    SubtitleVersion(slug="show-season-1", lang="farsi_persian", sub_id="1")
+                ],
+            )
+
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: _StubClient())
+
+    result = _runner().invoke(app, ["title", "show-season-1", "--json"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    assert data["slug"] == "show-season-1" and data["year"] == 2024
+    assert len(data["languages"]) == 2
+    assert data["url"].endswith("/subtitles/show-season-1")
+
+    result = _runner().invoke(app, ["title", "show-season-1"])
+    assert result.exit_code == 0, result.output
+    assert "Farsi/Persian" in result.output and "tt1234567" in result.output
+
+
+def _auto_stub_client():
+    from pysubzone.models import DownloadResult, TitleResult
+
+    class _StubClient:
+        def best_for_file(self, stem, lang=None):
+            return (
+                TitleResult(name="Show", slug="show-season-1", url=""),
+                SubtitleVersion(
+                    slug="show-season-1", lang="farsi_persian", sub_id="7",
+                    releases=["Show.S01E01.1080p"], author="t",
+                ),
+                55,
+            )
+
+        def download(self, target, **kwargs):
+            return DownloadResult(
+                zip_path=None, srt_paths=["/tmp/Show.S01E01.fa.srt"],
+                version=target, bytes_downloaded=100,
+            )
+
+    return _StubClient()
+
+
+def test_cli_auto_map_json_writes_file(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S01E01.1080p.mkv").touch()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: _auto_stub_client())
+    map_path = tmp_path / "out" / "map.json"
+
+    result = _runner().invoke(app, ["auto", str(tmp_path), "-y", "--map-json", str(map_path)])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(map_path.read_text())
+    assert data["summary"] == {"total": 1, "ok": 1}
+    assert data["results"][0]["status"] == "ok"
+    assert data["results"][0]["saved"] == ["/tmp/Show.S01E01.fa.srt"]
+    assert data["language"] == "farsi_persian"
+    assert "Wrote" in result.output
+
+
+def test_cli_auto_map_json_stdout_is_clean_json(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S01E01.1080p.mkv").touch()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: _auto_stub_client())
+
+    result = _runner().invoke(app, ["auto", str(tmp_path), "-y", "--map-json", "-"])
+    assert result.exit_code == 0
+    data = _json.loads(result.output)  # nothing but JSON on stdout
+    assert data["summary"]["total"] == 1
+
+
+def test_cli_auto_map_json_dry_run_and_min_score(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S01E01.1080p.mkv").touch()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: _auto_stub_client())
+
+    result = _runner().invoke(
+        app, ["auto", str(tmp_path), "-y", "--dry-run", "--map-json", "-"]
+    )
+    data = _json.loads(result.output)
+    assert data["results"][0]["status"] == "dry-run"
+    assert data["dry_run"] is True
+
+    result = _runner().invoke(
+        app, ["auto", str(tmp_path), "-y", "--min-score", "90", "--map-json", "-"]
+    )
+    data = _json.loads(result.output)
+    assert data["results"][0]["status"] == "skipped"
+    assert data["min_score"] == 90
+
+
+def test_cli_new_commands_and_network_options_listed(config_env):
+    from pysubzone.cli import app
+
+    help_text = _runner().invoke(app, ["--help"]).output
+    for name in ("title", "languages"):
+        assert name in help_text, f"missing command {name}"
+    for option in ("--min-interval", "--cache-ttl"):
+        assert option in help_text, f"missing option {option}"
+
+    auto_help = _runner().invoke(app, ["auto", "--help"]).output
+    assert "--map-json" in auto_help
+
+
+def test_config_network_rate_keys(config_env):
+    from pysubzone.config import load_config, set_config_value
+
+    assert set_config_value("network.min-interval", "0.5") == 0.5
+    assert set_config_value("network.cache-ttl", "30") == 30.0
+    flat = load_config()
+    assert flat["network.min-interval"] == 0.5
+    assert flat["network.cache-ttl"] == 30.0
+    with pytest.raises(ValueError):
+        set_config_value("network.min-interval", "999")  # out of bounds

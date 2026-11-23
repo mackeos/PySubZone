@@ -14,6 +14,7 @@ Quick start::
 """
 
 from .client import SubZoneClient
+from .async_client import AsyncSubZoneClient
 from .exceptions import (
     DownloadError,
     InvalidURLError,
@@ -31,11 +32,13 @@ from .models import (
     TitlePage,
     TitleResult,
 )
+from .scoring import DEFAULT_WEIGHTS, ScoreWeights
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "SubZoneClient",
+    "AsyncSubZoneClient",
     "SubZoneError",
     "NetworkError",
     "ParseError",
@@ -49,5 +52,7 @@ __all__ = [
     "SubtitleDetails",
     "DownloadResult",
     "BrowseEntry",
+    "ScoreWeights",
+    "DEFAULT_WEIGHTS",
     "__version__",
 ]

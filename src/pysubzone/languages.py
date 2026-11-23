@@ -190,3 +190,16 @@ def resolve(value: str | None) -> str | None:
 def known_languages() -> list[str]:
     """Sorted list of language slugs known to PySubZone."""
     return sorted(DISPLAY_NAMES)
+
+
+def codes_for(slug: str) -> list[str]:
+    """Short codes and aliases that :func:`resolve` maps to *slug*.
+
+    Excludes the canonical slug itself and the lower-cased display name;
+    returns them sorted, so ``codes_for("farsi_persian")`` yields
+    ``['fa', 'farsi', 'pe', 'per', 'persian']``.
+    """
+    canonical = DISPLAY_NAMES.get(slug, "").lower()
+    found = {alias for alias, target in _ALIASES.items() if target == slug}
+    found -= {slug, canonical}
+    return sorted(found)

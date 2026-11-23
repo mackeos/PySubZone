@@ -19,6 +19,8 @@ from __future__ import annotations
 import io
 import logging
 import re
+import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,6 +32,7 @@ from urllib3.util.retry import Retry
 
 from .exceptions import (
     DownloadError,
+    InvalidURLError,
     NetworkError,
     NoSubtitleFoundError,
     SubZoneError,
@@ -39,7 +42,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import guess_title, guess_season_episode
 from .models import DownloadResult, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
 from .parsing import parse_search, parse_subtitles_url, parse_subtitle_page, parse_title
-from .scoring import pick_best
+from .scoring import ScoreWeights, pick_best
 
 DEFAULT_BASE_URL = "https://subzone.ir"
 DEFAULT_USER_AGENT = (
@@ -100,10 +103,23 @@ class SubZoneClient:
         timeout: float = 20.0,
         max_retries: int = 3,
         verbose: bool = False,
+        min_request_interval: float = 0.0,
+        cache_ttl: float = 0.0,
+        cache_size: int = 256,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.verbose = verbose
+        # politeness rate limit: minimum seconds between two HTTP requests
+        self.min_request_interval = max(0.0, float(min_request_interval))
+        self._next_allowed = 0.0
+        self._rate_lock = threading.Lock()
+        # in-memory page cache: {cache_key: (monotonic_ts, response)};
+        # 0 disables it, stream=True downloads are never cached
+        self.cache_ttl = max(0.0, float(cache_ttl))
+        self.cache_size = max(0, int(cache_size))
+        self._cache = {}
+        self._cache_lock = threading.Lock()
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -135,6 +151,52 @@ class SubZoneClient:
             return path
         return f"{self.base_url}{path if path.startswith('/') else '/' + path}"
 
+    @staticmethod
+    def _cache_key(url: str, params: Optional[dict]) -> str:
+        if not params:
+            return url
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        return f"{url}?{query}"
+
+    def _throttle(self) -> None:
+        """Sleep just long enough to honor min_request_interval (global)."""
+        if self.min_request_interval <= 0:
+            return
+        with self._rate_lock:
+            wait = self._next_allowed - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self._next_allowed = time.monotonic() + self.min_request_interval
+
+    def _cache_get(self, key: str) -> Optional[requests.Response]:
+        if self.cache_ttl <= 0:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+        if entry is None:
+            return None
+        ts, response = entry
+        if time.monotonic() - ts > self.cache_ttl:
+            with self._cache_lock:
+                self._cache.pop(key, None)
+            return None
+        if self.verbose:
+            logger.info("cache hit %s", key)
+        return response
+
+    def _cache_put(self, key: str, response: requests.Response) -> None:
+        if self.cache_ttl <= 0 or self.cache_size <= 0:
+            return
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic(), response)
+            while len(self._cache) > self.cache_size:
+                self._cache.pop(next(iter(self._cache)))
+
+    def clear_cache(self) -> None:
+        """Drop every cached page (rate limiting is unaffected)."""
+        with self._cache_lock:
+            self._cache.clear()
+
     def _get(
         self,
         path: str,
@@ -145,6 +207,13 @@ class SubZoneClient:
         not_found_ok: bool = False,
     ) -> Optional[requests.Response]:
         url = self._url(path)
+        cacheable = not stream and self.cache_ttl > 0
+        key = self._cache_key(url, params) if cacheable else None
+        if key is not None:
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
+        self._throttle()
         headers = {"Referer": referer} if referer else None
         if self.verbose:
             logger.info("GET %s params=%s", url, params)
@@ -158,6 +227,8 @@ class SubZoneClient:
             return None
         if response.status_code >= 400:
             raise NetworkError(f"HTTP {response.status_code} for {url}")
+        if key is not None:
+            self._cache_put(key, response)
         return response
 
     # ------------------------------------------------------------------
@@ -240,13 +311,15 @@ class SubZoneClient:
         filename_stem: str,
         lang: Optional[str] = DEFAULT_LANGUAGE,
         title_query: Optional[str] = None,
+        weights: Optional[ScoreWeights] = None,
     ) -> Tuple[TitleResult, SubtitleVersion, int]:
         """Find the best subtitle version for a video release name.
 
         ``filename_stem`` is the video file name without extension.  The
         title is resolved via site search (query derived from the file name
         unless *title_query* is given), then versions are scored by release
-        similarity (episode numbers must agree).
+        similarity (episode numbers must agree).  *weights* optionally
+        tunes the scoring via :class:`~.scoring.ScoreWeights`.
         """
         query = title_query or guess_title(filename_stem)
         if not query:
@@ -257,7 +330,7 @@ class SubZoneClient:
             raise NoSubtitleFoundError(
                 f"no subtitles for {title.name!r} in {display_name(resolve(lang) or '')}"
             )
-        picked = pick_best(filename_stem, versions)
+        picked = pick_best(filename_stem, versions, weights)
         if not picked:
             raise NoSubtitleFoundError(
                 f"no version of {title.name!r} matches {filename_stem!r}"
@@ -582,6 +655,7 @@ class SubZoneClient:
         return written
 
     def close(self) -> None:
+        self.clear_cache()
         self.session.close()
 
     def __enter__(self) -> "SubZoneClient":

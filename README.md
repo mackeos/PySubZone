@@ -22,6 +22,9 @@ Inspired by [PyAddic7](https://github.com/mackeos/PyAddic7), which works with ad
 - **Browse subtitle versions** — see the uploads available for a title, with language filtering.
 - **Download subtitles** — download a specific upload by reference or URL, or grab the newest uploads from a title page.
 - **Match video files automatically** — search for suitable subtitles based on release names, including episode number, resolution, source, and release group.
+- **Discover languages** — list every language the engine understands, with aliases and short codes.
+- **Script it** — every command speaks `--json`, `subz auto` can export a full result map, and the API ships type hints (`py.typed`) plus an async client.
+- **Stay polite** — built-in rate limiting and page caching keep request traffic friendly to the site.
 - **Use it your way** — choose the Python API, the command-line interface, or the interactive terminal UI.
 
 The CLI is built with [Typer](https://typer.tiangolo.com/) and Rich, while the interactive TUI is powered by [Textual](https://github.com/Textualize/textual).
@@ -79,14 +82,16 @@ subz download dexter-resurrection-season-2/farsi_persian/3770171
 ```text
 subz search QUERY [-l LANG] [--json]          Search titles
 subz versions TITLE [-l LANG] [--json]        List subtitle uploads
+subz title TITLE [--json]                     Title details + language overview
 subz download REF [-o DIR] [--zip] [--json]   Download by reference, URL, or slug
 subz url URL [-l LANG] [-n N] [--zip]         Download from a SubZone URL
 subz filename FILE [-l LANG] [--no-download]  Find the best subtitle for one video
             [--min-score N]
 subz auto PATH [-l LANG] [-o DIR] [--out-cwd]    Match videos in a folder
-            [--min-score N] [--parallel 1-8]
+            [--min-score N] [--parallel 1-8] [--map-json FILE|-]
 subz popular [--mode popular|latest]           Browse popular or latest uploads
             [-t all|film|series|music] [-p PAGE]
+subz languages [--json]                        List known languages + aliases
 subz config show|set|unset|path               Manage the config file
 subz tui                                       Open the interactive interface
 ```
@@ -97,6 +102,8 @@ Global options:
 - `--user-agent` — set the HTTP user agent.
 - `--timeout` — configure the request timeout.
 - `--retries` — configure retry attempts.
+- `--min-interval` — minimum seconds between HTTP requests (politeness rate limit).
+- `--cache-ttl` — seconds to keep fetched pages in an in-memory cache.
 - `-v`, `--verbose` — enable verbose output.
 
 Every data command supports `--json` for scripting and automation.
@@ -120,6 +127,14 @@ subz search odyssey -l fa
 
 # List Farsi subtitle versions for a title
 subz versions dexter-resurrection-season-2 -l fa
+
+# Title details: year, IMDb id and which languages have subtitles
+subz title dexter-resurrection-season-2
+subz title "dexter resurrection" --json
+
+# Every language the engine understands, with short codes and aliases
+subz languages
+subz languages --json
 
 # Browse popular movie uploads
 subz popular -t film
@@ -196,6 +211,18 @@ Quality and speed controls:
 
 Both options can also be set permanently in the [config file](#configuration-file) as `defaults.min-score` and `defaults.workers`.
 
+For scripting, `--map-json` writes the complete per-video result map — every match, score, status and saved path, plus a summary — as JSON:
+
+```bash
+# Write the map to a file (same shape as --json, plus a summary object)
+subz auto /media/shows -l fa --map-json results.json
+
+# Or print the map to stdout instead of the table
+subz auto /media/shows -l fa --map-json -
+```
+
+The JSON contains `results` (one object per video: `video`, `title`, `ref`, `score`, `status`, `saved`/`error`) and a `summary` (`total`, `ok`, `skipped`, `not found`, `dry-run`, `error` counts), together with the run's `language`, `min_score`, `workers` and `dry_run` settings.
+
 A failed match does not stop the whole collection: unsuccessful files are included in the final summary.
 
 ### Configuration file
@@ -230,6 +257,8 @@ Available keys:
 | `network.timeout` | number | HTTP timeout in seconds |
 | `network.retries` | integer 0-10 | Retries per request |
 | `network.verbose` | true/false | Log HTTP requests |
+| `network.min-interval` | number 0-60 | Minimum seconds between HTTP requests (rate limit) |
+| `network.cache-ttl` | number 0-3600 | Seconds to cache fetched pages in memory |
 
 Command-line flags always win: an option given on the command line overrides the config file, which overrides the built-in default.
 
@@ -337,6 +366,60 @@ for result in results:
         print("failed:", result)
 ```
 
+### Tuning the match score
+
+The auto-match ranking is built from weighted components (resolution, source, release group, token overlap, ...). Pass a `ScoreWeights` instance to emphasize what matters for your library:
+
+```python
+from pysubzone import ScoreWeights, SubZoneClient
+
+client = SubZoneClient()
+
+# Release-group agreement matters more than resolution here
+weights = ScoreWeights(resolution_match=10, group_match=50)
+title, version, score = client.best_for_file(
+    "Show.S01E01.1080p.WEB-DL-NTb",
+    lang="fa",
+    weights=weights,
+)
+```
+
+`ScoreWeights()` with no arguments reproduces the built-in ranking exactly. The episode-mismatch hard reject is not a weight and always applies.
+
+### Rate limiting and caching
+
+Two client options keep traffic friendly and fast — useful for long `auto` runs and batch scripts:
+
+```python
+client = SubZoneClient(
+    min_request_interval=0.5,   # >= 0.5s between HTTP requests
+    cache_ttl=300,              # cache fetched pages for 5 minutes
+    cache_size=256,             # pages kept in memory
+)
+```
+
+Cached pages are returned instantly until they expire (`clear_cache()` drops them; downloads are never cached). The same values can be set globally via `--min-interval` / `--cache-ttl` or the `network.min-interval` / `network.cache-ttl` config keys.
+
+### Async client
+
+`AsyncSubZoneClient` mirrors the full synchronous API and offloads every call to a worker thread, so it never blocks your event loop while still reusing the same scraping, retry, rate-limit and cache logic:
+
+```python
+import asyncio
+from pysubzone import AsyncSubZoneClient
+
+async def main():
+    async with AsyncSubZoneClient(min_request_interval=0.5, cache_ttl=300) as client:
+        results = await client.search("dexter")
+        page = await client.title(results[0].slug)
+        versions = await client.title_versions(results[0].slug, "fa")
+        await client.download(versions[0], dest_dir="subs")
+
+asyncio.run(main())
+```
+
+The package ships a `py.typed` marker, so type checkers see the annotations of every public API.
+
 All client exceptions derive from `pysubzone.SubZoneError`. Specific errors include `NetworkError`, `TitleNotFoundError`, `NoSubtitleFoundError`, and `DownloadError`.
 
 ## How it works
@@ -345,12 +428,13 @@ The project is organized into a few focused modules:
 
 ```text
 src/pysubzone/
-  client.py       HTTP client, retries, signed-CDN downloads, ZIP verification
+  client.py       HTTP client, retries, rate limiting, page cache, signed-CDN downloads
+  async_client.py Async facade over the sync client (asyncio.to_thread)
   parsing.py      Search, title, version, and browse-page parsers
   models.py       Data models with as_dict() support for JSON output
   languages.py    Language slugs and aliases (fa, en, tr, ...)
   matcher.py      Release-name parsing and video-folder scanning
-  scoring.py      Subtitle-version scoring for auto-match
+  scoring.py      Subtitle-version scoring for auto-match (ScoreWeights)
   config.py       TOML config file and remembered TUI settings
   cli.py          Typer command-line interface
   tui.py          Textual terminal interface

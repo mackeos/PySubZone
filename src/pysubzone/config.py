@@ -52,6 +52,8 @@ CONFIG_SPEC: Dict[str, Tuple[str, type, str]] = {
     "network.timeout": ("network", float, "HTTP timeout in seconds."),
     "network.retries": ("network", int, "Retries per request."),
     "network.verbose": ("network", bool, "Log HTTP requests."),
+    "network.min-interval": ("network", float, "Minimum seconds between HTTP requests (politeness rate limit, 0 = off)."),
+    "network.cache-ttl": ("network", float, "Seconds to keep fetched pages in an in-memory cache (0 = off)."),
 }
 
 # dotted key -> (inclusive minimum, inclusive maximum) for numeric keys
@@ -60,6 +62,8 @@ _CONFIG_BOUNDS: Dict[str, Tuple[float, float]] = {
     "defaults.workers": (1, 8),
     "network.timeout": (1, 600),
     "network.retries": (0, 10),
+    "network.min-interval": (0, 60),
+    "network.cache-ttl": (0, 3600),
 }
 
 

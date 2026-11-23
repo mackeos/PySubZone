@@ -10,6 +10,9 @@ results: every command accepts ``--json`` and uses stable exit codes
     subz url https://subzone.ir/subtitles/the-odyssey-2026 -n 2
     subz filename Dexter.Resurrection.S02E01.1080p.AMZN.WEB-DL-NTb.mkv
     subz auto /media/shows --dry-run
+    subz auto /media/shows --map-json results.json
+    subz title dexter-resurrection-season-2
+    subz languages
     subz config set defaults.min-score 60
     subz tui
 """
@@ -81,6 +84,8 @@ class Settings:
         retries: int,
         verbose: bool,
         config: Optional[Dict[str, Any]] = None,
+        min_interval: float = 0.0,
+        cache_ttl: float = 0.0,
     ) -> None:
         self.base_url = base_url
         self.user_agent = user_agent
@@ -88,6 +93,8 @@ class Settings:
         self.retries = retries
         self.verbose = verbose
         self.config: Dict[str, Any] = config or {}
+        self.min_interval = min_interval
+        self.cache_ttl = cache_ttl
 
 
 def _cfg(settings: Settings, key: str, fallback: Any) -> Any:
@@ -102,6 +109,8 @@ def _client(settings: Settings) -> SubZoneClient:
         timeout=settings.timeout,
         max_retries=settings.retries,
         verbose=settings.verbose,
+        min_request_interval=settings.min_interval,
+        cache_ttl=settings.cache_ttl,
     )
 
 
@@ -254,6 +263,58 @@ def versions(
         table.add_row(v.language or display_name(v.lang), rate, v.author, releases, v.ref)
     console.print(table)
     console.print("[dim]Next: subz download <ref>[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# title
+# ---------------------------------------------------------------------------
+
+@app.command("title")
+def title_cmd(
+    ctx: typer.Context,
+    title: str = typer.Argument(..., help="Title slug (dexter-resurrection-season-2) or a show/movie name."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
+) -> None:
+    """Show a title's details and which languages have subtitles."""
+    client = _client(ctx.obj)
+    try:
+        resolved = _resolve_title_arg(client, title)
+        page = client.title(resolved.slug)
+    except (TitleNotFoundError, NoSubtitleFoundError) as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_NOT_FOUND))
+    except SubZoneError as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+
+    if json_out:
+        payload = page.as_dict()
+        payload["url"] = f"{client.base_url}/subtitles/{page.slug}"
+        _emit(payload, True)
+        return
+
+    heading = f"{page.name}"
+    if page.year:
+        heading += f" ({page.year})"
+    meta = Table(title=heading, box=box.SIMPLE_HEAVY, show_header=False)
+    meta.add_column("field", style="dim")
+    meta.add_column("value", overflow="fold")
+    meta.add_row("title page", f"{client.base_url}/subtitles/{page.slug}")
+    if page.imdb_id:
+        meta.add_row("imdb", page.imdb_id)
+    meta.add_row("versions", str(len(page.versions)))
+    console.print(meta)
+
+    lang_table = Table(title="Languages", box=box.SIMPLE_HEAVY)
+    lang_table.add_column("language")
+    lang_table.add_column("slug", style="dim")
+    lang_table.add_column("subs", justify="right")
+    for tab in page.languages:
+        lang_table.add_row(
+            display_name(tab["slug"]),
+            tab["slug"],
+            str(tab.get("count", "-")),
+        )
+    console.print(lang_table)
+    console.print("[dim]Next: subz versions <slug> -l <slug>[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +565,7 @@ def auto(
     parallel: Optional[int] = typer.Option(None, "--parallel", "-w", help="Download for this many videos concurrently, 1-8 (default: config defaults.workers)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Only show the matches, download nothing."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    map_json: Optional[str] = typer.Option(None, "--map-json", metavar="[PATH]", help="Write the per-video result map as JSON to PATH ('-' = stdout; shape: results + summary)."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
     """Auto-match every video in PATH and download fitting subtitles."""
@@ -525,7 +587,7 @@ def auto(
     if not videos:
         raise typer.Exit(_fail(f"No video files found under {path}", EXIT_NOT_FOUND))
 
-    if not json_out:
+    if not json_out and map_json != "-":
         console.print(f"[bold]{len(videos)} video file(s)[/bold] under {path}")
         for v in videos:
             console.print(f"  [dim]-[/dim] {v.name}")
@@ -574,7 +636,7 @@ def auto(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         console=console,
-        disable=json_out,
+        disable=json_out or map_json == "-",
     )
     rows: List[Dict[str, Any]] = [None] * len(videos)  # type: ignore[list-item]
     with progress:
@@ -593,7 +655,25 @@ def auto(
                 rows[i] = _match_one(video)
                 progress.advance(task)
 
-    if json_out:
+    map_payload: Optional[Dict[str, Any]] = None
+    if map_json is not None:
+        counts: Dict[str, int] = {}
+        for row in rows:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        map_payload = {
+            "path": str(path),
+            "language": lang_slug,
+            "min_score": min_score,
+            "workers": workers,
+            "dry_run": dry_run,
+            "results": rows,
+            "summary": {"total": len(rows), **counts},
+        }
+
+    if map_json == "-":
+        # machine-readable stdout: no tables, no progress noise
+        print(json.dumps(map_payload, ensure_ascii=False, indent=2))
+    elif json_out:
         _emit(rows, True)
     else:
         summary = Table(title="Auto-match summary", box=box.SIMPLE_HEAVY)
@@ -615,6 +695,14 @@ def auto(
                 saved,
             )
         console.print(summary)
+        if map_payload is not None:
+            map_path = Path(map_json).expanduser()
+            map_path.parent.mkdir(parents=True, exist_ok=True)
+            map_path.write_text(
+                json.dumps(map_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            console.print(f"[green]Wrote[/green] result map -> {map_path}")
 
     saw_error = any(row["status"] == "error" for row in rows)
     saw_missing = any(row["status"] in ("not found", "skipped") for row in rows)
@@ -670,6 +758,38 @@ def popular(
         )
     console.print(table)
     console.print("[dim]Next: subz download <ref>[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# languages
+# ---------------------------------------------------------------------------
+
+@app.command("languages")
+def languages_cmd(
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
+) -> None:
+    """List every subtitle language the engine understands (with aliases)."""
+    from .languages import DISPLAY_NAMES, codes_for, known_languages
+
+    slugs = known_languages()
+    if json_out:
+        _emit(
+            [{"slug": slug, "name": DISPLAY_NAMES[slug], "codes": codes_for(slug)} for slug in slugs],
+            True,
+        )
+        return
+    table = Table(title=f"{len(slugs)} known languages", box=box.SIMPLE_HEAVY)
+    table.add_column("language")
+    table.add_column("slug", style="bold cyan")
+    table.add_column("short codes / aliases", style="dim")
+    for slug in slugs:
+        codes = ", ".join(codes_for(slug))
+        table.add_row(DISPLAY_NAMES[slug], slug, codes or "-")
+    console.print(table)
+    console.print(
+        "[dim]Use any slug, name or code with -l/--lang, e.g.:[/dim] "
+        "[bold]subz versions dexter-resurrection-season-2 -l fa[/bold]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +890,8 @@ def _callback(
     user_agent: Optional[str] = typer.Option(None, "--user-agent", help="User-Agent header (default: config network.user-agent)."),
     timeout: Optional[float] = typer.Option(None, "--timeout", help="HTTP timeout in seconds (default: config network.timeout)."),
     retries: Optional[int] = typer.Option(None, "--retries", help="Retries per request (default: config network.retries)."),
+    min_interval: Optional[float] = typer.Option(None, "--min-interval", help="Minimum seconds between HTTP requests - politeness rate limit (default: config network.min-interval, 0 = off)."),
+    cache_ttl: Optional[float] = typer.Option(None, "--cache-ttl", help="Seconds to cache fetched pages in memory (default: config network.cache-ttl, 0 = off)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Log HTTP requests."),
 ) -> None:
     """[bold]subz[/bold] - search and download subtitles from subzone.ir."""
@@ -781,6 +903,8 @@ def _callback(
         retries=int(retries if retries is not None else cfg.get("network.retries", 3)),
         verbose=verbose or bool(cfg.get("network.verbose", False)),
         config=cfg,
+        min_interval=float(min_interval if min_interval is not None else cfg.get("network.min-interval", 0.0)),
+        cache_ttl=float(cache_ttl if cache_ttl is not None else cfg.get("network.cache-ttl", 0.0)),
     )
 
 
