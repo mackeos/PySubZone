@@ -163,6 +163,9 @@ subz download https://subzone.ir/subtitles/dexter-resurrection-season-2/farsi_pe
 # Grab the two newest Farsi uploads from a title URL
 subz url https://subzone.ir/subtitles/the-odyssey-2026 -l fa -n 2
 
+# The language can also come straight from a language page URL
+subz url https://subzone.ir/subtitles/arcane-league-of-legends-first-season/farsi_persian -n 3
+
 # Grab all available uploads from that title URL
 subz url https://subzone.ir/subtitles/the-odyssey-2026 -l fa -n 0
 
@@ -171,6 +174,8 @@ subz download the-odyssey-2026 -l en --zip --out ./downloads
 ```
 
 By default, downloaded archives are **extracted** and subtitle files receive a language suffix, such as `Movie.fa.srt` (or retain the release name when the archive includes one).
+
+When a multi-version grab hits a **stale upload** whose CDN file is gone (HTTP 404 or an S3 `NoSuchKey` response), that version is skipped with a warning and the rest of the grab continues; the command fails only when every requested version is dead.
 
 Useful output options:
 

@@ -41,6 +41,18 @@ def test_parse_subtitles_url_variants():
     ) == ("the-odyssey-2026", "farsi_persian", "3768757")
 
 
+def test_parse_subtitles_url_language_page():
+    """Title+language URLs (as copied from the browser) resolve to the language."""
+    assert parse_subtitles_url(
+        "https://subzone.ir/subtitles/arcane-league-of-legends-first-season/farsi_persian"
+    ) == ("arcane-league-of-legends-first-season", "farsi_persian", None)
+    assert parse_subtitles_url("/subtitles/show-season-1/english/") == (
+        "show-season-1",
+        "english",
+        None,
+    )
+
+
 def test_parse_subtitles_url_rejects_garbage():
     with pytest.raises(ValueError):
         parse_subtitles_url("https://example.com/other/page")
@@ -1113,3 +1125,92 @@ def test_config_network_rate_keys(config_env):
     assert flat["network.cache-ttl"] == 30.0
     with pytest.raises(ValueError):
         set_config_value("network.min-interval", "999")  # out of bounds
+
+
+def test_cli_url_accepts_language_page_url(config_env, monkeypatch):
+    """`subz url <title>/<lang>` grabs that language without -l (v0.4.1)."""
+    from pysubzone.cli import app
+
+    recorded = {}
+
+    class _StubClient:
+        base_url = "https://subzone.ir"
+
+        def download_url(self, url, lang=None, limit=1, **kwargs):
+            recorded["url"] = url
+            recorded["lang"] = lang
+            recorded["limit"] = limit
+            return []
+
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: _StubClient())
+
+    result = _runner().invoke(
+        app,
+        ["url", "https://subzone.ir/subtitles/show-season-1/farsi_persian", "-n", "2"],
+    )
+    assert result.exit_code == 0, result.output
+    assert recorded["url"] == "/subtitles/show-season-1"
+    assert recorded["lang"] == "farsi_persian"  # taken from the URL itself
+    assert recorded["limit"] == 2
+
+    # an explicit -l still wins over the URL language (passed through raw;
+    # client.download_url resolves aliases like "en" -> "english" itself)
+    result = _runner().invoke(
+        app,
+        [
+            "url",
+            "https://subzone.ir/subtitles/show-season-1/farsi_persian",
+            "-l",
+            "en",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert recorded["lang"] == "en"
+
+
+def test_download_cdn_404_raises_friendly_error(tmp_path, monkeypatch):
+    """A 404 from the signed CDN link becomes the stale-upload error, not NetworkError."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import DownloadError
+
+    client = SubZoneClient()
+    monkeypatch.setattr(client, "_get", lambda *a, **k: None)  # _get 404 -> None
+    # releases set -> download() skips the metadata prefetch that also uses _get
+    version = SubtitleVersion(
+        slug="show", lang="farsi_persian", sub_id="42", releases=["Show.S01E01.1080p"]
+    )
+    with pytest.raises(DownloadError) as excinfo:
+        client.download(version, dest_dir=tmp_path)
+    assert "missing on the site's CDN" in str(excinfo.value)
+    assert "try another version" in str(excinfo.value)
+
+
+def test_download_url_skips_stale_uploads_but_keeps_the_rest(tmp_path, monkeypatch):
+    """One dead CDN link no longer aborts a multi-version URL grab (v0.4.1)."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import DownloadError, NoSubtitleFoundError
+    from pysubzone.models import SubtitleVersion
+
+    client = SubZoneClient()
+    versions = [
+        SubtitleVersion(slug="show", lang="farsi_persian", sub_id=str(i), releases=["Show.S01E01"])
+        for i in (1, 2, 3)
+    ]
+    monkeypatch.setattr(client, "title_versions", lambda slug, lang=None: versions)
+
+    def fake_download(target, **kwargs):
+        if target.sub_id == "2":
+            raise DownloadError("subtitle file missing on the site's CDN (HTTP 404)")
+        return _result_for(target.ref)
+
+    monkeypatch.setattr(client, "download", fake_download)
+    results = client.download_url("/subtitles/show", limit=3)
+    assert [r.version.sub_id for r in results] == ["1", "3"]  # dead upload skipped
+
+    # every version dead -> the first error is re-raised
+    def all_dead(target, **kwargs):
+        raise DownloadError("subtitle file missing on the site's CDN (HTTP 404)")
+
+    monkeypatch.setattr(client, "download", all_dead)
+    with pytest.raises(DownloadError):
+        client.download_url("/subtitles/show", limit=3)

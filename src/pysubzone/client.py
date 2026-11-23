@@ -404,11 +404,20 @@ class SubZoneClient:
         else:
             zip_name = f"{version.slug}-{version.lang}-{version.sub_id}.zip"
         zip_path = dest / zip_name
+        # A 404 here can come from the signed CDN link itself (the site still
+        # issues the redirect, but the file is gone) - surface it as the same
+        # "stale upload" problem users already know from the NoSuchKey case.
         response = self._get(
             f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}/download",
             stream=True,
             referer=f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}",
+            not_found_ok=True,
         )
+        if response is None:
+            raise DownloadError(
+                "subtitle file missing on the site's CDN (HTTP 404); "
+                "try another version"
+            )
         total = response.headers.get("Content-Length")
         total_bytes = int(total) if total and total.isdigit() else None
 
@@ -471,8 +480,13 @@ class SubZoneClient:
         """'URL grab': download from any subzone.ir subtitles URL.
 
         * version URL (``/subtitles/<slug>/<lang>/<id>``) - exactly one file
-        * title URL (``/subtitles/<slug>``) - the newest *limit* versions in
-          *lang* (``limit=0`` grabs every version of that language)
+        * title URL (``/subtitles/<slug>`` or ``/subtitles/<slug>/<lang>``)
+          - the newest *limit* versions in *lang* (``limit=0`` grabs every
+          version of that language)
+
+        When several versions are grabbed, one with a dead CDN link (stale
+        upload) is skipped with a logged warning instead of aborting the
+        grab; the first error is re-raised only when every version failed.
         """
         slug, url_lang, sub_id = parse_subtitles_url(url)
         if lang and sub_id is None:
@@ -493,7 +507,23 @@ class SubZoneClient:
             raise NoSubtitleFoundError(
                 f"no subtitles for {slug!r} in {display_name(lang_slug or '')}"
             )
-        return [self.download(v, **download_kwargs) for v in versions]
+        results: List[DownloadResult] = []
+        first_error: Optional[DownloadError] = None
+        for version in versions:
+            try:
+                results.append(self.download(version, **download_kwargs))
+            except DownloadError as exc:
+                # dead CDN link / stale upload: keep grabbing the rest
+                logger.warning("skipping %s: %s", version.ref, exc)
+                if first_error is None:
+                    first_error = exc
+        if not results:
+            if first_error is not None:
+                raise first_error
+            raise NoSubtitleFoundError(
+                f"no subtitles for {slug!r} in {display_name(lang_slug or '')}"
+            )
+        return results
 
     def grab_url(self, url: str, **download_kwargs) -> List[DownloadResult]:
         """Alias of :meth:`download_url` (URL grab command)."""

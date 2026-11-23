@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup, Tag
 
 from .models import BrowseEntry, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
 
-_TITLE_URL_RE = re.compile(r"^/subtitles/([A-Za-z0-9_\-]+)/?$")
+_TITLE_URL_RE = re.compile(r"^/subtitles/([A-Za-z0-9_\-]+)(?:/([a-z_\-]+))?/?$")
 _VERSION_URL_RE = re.compile(r"^/subtitles/([A-Za-z0-9_\-]+)/([a-z_\-]+)/(\d+)/?(?:download)?/?$")
 _YEAR_RE = re.compile(r"\((\d{4})\)\s*$")
 _COUNT_RE = re.compile(r"(\d[\d\s]*)")
@@ -56,8 +56,13 @@ def _clean(text: str) -> str:
 def parse_subtitles_url(url: str) -> Tuple[str, Optional[str], Optional[str]]:
     """Classify a subzone.ir URL.
 
-    Returns ``(slug, lang, sub_id)`` where *lang* and *sub_id* are ``None``
-    for a bare title URL (``/subtitles/<slug>`` or ``/subtitles/<slug>/<lang>``).
+    Returns ``(slug, lang, sub_id)``:
+
+    * ``/subtitles/<slug>``                -> ``(slug, None, None)``
+    * ``/subtitles/<slug>/<lang>``         -> ``(slug, lang, None)``
+    * ``/subtitles/<slug>/<lang>/<id>``    -> ``(slug, lang, id)``
+      (an optional trailing ``/download`` is accepted)
+
     Raises ValueError for anything else.
     """
     path = urlparse(url).path.rstrip("/") if "://" in url else url.rstrip("/")
@@ -67,7 +72,7 @@ def parse_subtitles_url(url: str) -> Tuple[str, Optional[str], Optional[str]]:
         return slug, lang, sub_id
     title = _TITLE_URL_RE.match(path)
     if title:
-        return title.group(1), None, None
+        return title.group(1), title.group(2), None
     raise ValueError(f"Not a subzone.ir subtitles URL: {url!r}")
 
 
