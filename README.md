@@ -205,7 +205,7 @@ subz auto /media/shows -l fa -o subs
 subz auto /media/shows -l fa -o subs --out-cwd
 ```
 
-For each video, the release name is parsed for details such as the title, season and episode, resolution, source, and release group. Subtitle versions with conflicting episode numbers are rejected, exact release matches are preferred, and season packs can be used as fallbacks.
+For each video, the release name is parsed for details such as the title, season and episode, resolution, source, and release group. Subtitle versions are rejected when their season disagrees with the video's (word forms like "Complete First Season" or "فصل دوم" count too), when their explicit episode span does not cover the video (an act pack `S02E01-E03` matches episodes 1-3 only), or when pinned episode numbers conflict. Exact release matches are preferred, and season packs of the *same* season can be used as fallbacks.
 
 The output folder is controlled by `-o/--out`. A **relative** path is created **inside the videos folder** (each video's own folder), so `-o subs` collects subtitles in a `subs` folder next to the videos. An **absolute** path is used exactly as given. Without `-o`, subtitles are saved beside each video. To resolve relative paths against the current directory instead (the behavior up to v0.1.1), pass `--out-cwd`.
 

@@ -5,6 +5,8 @@ file name in the way release scenes name files:
 
 * ``Dexter.Resurrection.S02E01.Risky.Business.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv``
   -> title query "Dexter Resurrection", season 2, episode 1
+* ``Arcane Season 2 Episode 1 1080p NF WEB-DL.mkv``
+  -> title query "Arcane" (word-form season/episode tokens are cut too)
 * ``The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv``
   -> title query "The Odyssey" (year kept separate)
 """
@@ -24,6 +26,7 @@ _CUT_RE = re.compile(
     r"\b(?:"
     r"s\d{1,2}[\s._-]*e\d{1,3}"          # SxxEyy
     r"|\b\d{1,2}x\d{1,3}\b"                # 2x05
+    r"|\bseason[\s._-]*\d{1,2}\b"          # "Season 2" / "SEASON.01" word form
     r"|(?:19|20)\d{2}"                     # year
     r"|\b(?:2160p|1080[pi]|720p|576p|480p)\b"
     r"|\b(?:web-?dl|webdl|webrip|web|bluray|blu-ray|bdrip|brrip|dvdrip|hdrip|"

@@ -1,11 +1,12 @@
 """Best-version selection for the auto-match mode.
 
 Given a video release name and a list of subtitle versions, score how well
-each version fits the video: episode numbers must match, and resolution /
-source / release-group tokens earn bonus points.  The design mirrors the
-"scoreBestSubVersions" idea of PyAddic7 but is tuned to the Subf2m layout,
-where a version exposes one or more *release info* lines instead of a
-single distribution string.
+each version fits the video: seasons must agree, the video's episode must
+fall inside the subtitle's explicit episode span (``S02E01-E03`` covers
+episodes 1-3), and resolution / source / release-group tokens earn bonus
+points.  The design mirrors the "scoreBestSubVersions" idea of PyAddic7
+but is tuned to the Subf2m layout, where a version exposes one or more
+*release info* lines instead of a single distribution string.
 """
 
 from __future__ import annotations
@@ -31,6 +32,42 @@ _SEASON_EPISODE_RE = re.compile(
 _EPISODE_ONLY_RE = re.compile(r"\b(?:e|ep)[\s._-]*(\d{1,3})\b", re.IGNORECASE)
 _SEASON_ONLY_RE = re.compile(r"\bs(\d{1,2})\b(?![\s._-]*e)", re.IGNORECASE)
 
+# --- season / episode-range awareness (0.4.3) ------------------------------
+
+_SEASON_TOKEN_RE = re.compile(r"\bs(\d{1,2})\b", re.IGNORECASE)
+_SEASON_WORD_NUM_RE = re.compile(r"\bseason[\s._-]*(\d{1,2})\b", re.IGNORECASE)
+_SEASON_ORDINALS = {
+    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "sixth": 6, "6th": 6,
+    "seventh": 7, "7th": 7, "eighth": 8, "8th": 8, "ninth": 9, "9th": 9,
+    "tenth": 10, "10th": 10,
+}
+_SEASON_WORD_ORD_RE = re.compile(
+    r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|"
+    r"seventh|7th|eighth|8th|ninth|9th|tenth|10th)[\s._-]+season\b"
+    r"|\bseason[\s._-]+"
+    r"(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|"
+    r"seventh|7th|eighth|8th|ninth|9th|tenth|10th)\b",
+    re.IGNORECASE,
+)
+_SEASON_FA_RE = re.compile(
+    r"فصل[\s._\u200c-]*(اول|دوم|سوم|چهارم|پنجم|ششم|هفتم|هشتم|نهم|دهم|\d{1,2})"
+)
+_SEASON_FA_ORDINALS = {
+    "اول": 1, "دوم": 2, "سوم": 3, "چهارم": 4, "پنجم": 5,
+    "ششم": 6, "هفتم": 7, "هشتم": 8, "نهم": 9, "دهم": 10,
+}
+# S02E01-E03 / S01E07~E09 / S02E04-E05-E06 / S02EP01 -> (season, first..last)
+# Range tails must carry an explicit E/EP prefix, so release-group tokens
+# like "-4chan" or "-2CH" are never mistaken for episode numbers.
+_EPISODE_RANGE_RE = re.compile(
+    r"\bs(\d{1,2})[\s._-]*ep?(\d{1,3})(?!\d)"
+    r"((?:\s*[-–—~]\s*ep?\d{1,3}(?!\d))*)",
+    re.IGNORECASE,
+)
+_EPISODE_WORD_RE = re.compile(r"\be(?:pisode)?[\s._-]*(\d{1,3})(?!\d)", re.IGNORECASE)
+_ALT_SE_RE = re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.IGNORECASE)
+
 SOURCE_ALIASES = {
     "webdl": "web-dl",
     "web": "web-dl",
@@ -47,9 +84,9 @@ class ScoreWeights:
     Defaults reproduce the built-in ranking exactly.  Pass a modified
     instance to :func:`pick_best` / :meth:`SubZoneClient.best_for_file` to
     emphasize what matters for your library (e.g. resolution over release
-    group).  ``score_release`` rejects a pair outright when both sides carry
-    explicit season/episode numbers that disagree - that hard rule is not a
-    weight and always applies.
+    group).  ``score_release`` rejects a pair outright when the seasons
+    disagree or the video's episode falls outside the subtitle's explicit
+    episode span - those hard rules are not weights and always apply.
     """
 
     resolution_match: int = 25       # same resolution token on both sides
@@ -110,29 +147,115 @@ def extract_season(name: str) -> Optional[int]:
     return None
 
 
+@dataclass(frozen=True)
+class SeasonInfo:
+    """Season / episode span parsed from one release name."""
+
+    season: Optional[int]                        # None = unknown / ambiguous
+    episodes: Optional[Tuple[int, int]] = None   # inclusive (first, last); None = no explicit episodes
+
+
+def season_info(name: str) -> SeasonInfo:
+    """Extract the season and explicit episode span of a release name.
+
+    Numeric season tokens (``S02``, ``SEASON.01``, the ``Sxx`` of ``S02E05``)
+    take precedence over word forms ("First Season", "Complete Season 1",
+    ``فصل دوم``); several conflicting numeric tokens (``S01-S02``) make the
+    season *unknown*, which disables the guard instead of guessing.
+    ``episodes`` is an inclusive ``(first, last)`` span: single pins such as
+    ``S02E05`` or ``2x05`` give ``(5, 5)``, multi-episode packs give real
+    ranges, and lines without explicit episode tokens give ``None``.
+    """
+    episodes: Optional[Tuple[int, int]] = None
+    season_from_range: Optional[int] = None
+    m = _EPISODE_RANGE_RE.search(name)
+    if m:
+        eps = [int(m.group(2))]
+        for extra in re.finditer(r"(\d{1,3})(?!\d)", m.group(3) or ""):
+            eps.append(int(extra.group(1)))
+        episodes = (min(eps), max(eps))
+        season_from_range = int(m.group(1))
+    if episodes is None:
+        se = extract_season_episode(name)
+        if se:
+            episodes = (se[1], se[1])
+    if episodes is None:
+        m = _ALT_SE_RE.search(name)
+        if m:
+            episodes = (int(m.group(2)), int(m.group(2)))
+            season_from_range = int(m.group(1))
+    if episodes is None:
+        e = extract_episode(name)
+        if e is not None:
+            episodes = (e, e)
+    if episodes is None:
+        m = _EPISODE_WORD_RE.search(name)
+        if m:
+            episodes = (int(m.group(1)), int(m.group(1)))
+
+    numeric = {int(x) for x in _SEASON_TOKEN_RE.findall(name)}
+    numeric |= {int(x) for x in _SEASON_WORD_NUM_RE.findall(name)}
+    if season_from_range is not None:
+        numeric.add(season_from_range)
+    season: Optional[int] = None
+    if len(numeric) == 1:
+        season = next(iter(numeric))
+    elif not numeric:
+        words: set = set()
+        m = _SEASON_WORD_ORD_RE.search(name)
+        if m:
+            for g in m.groups():
+                if g:
+                    words.add(_SEASON_ORDINALS[g.lower()])
+                    break
+        m = _SEASON_FA_RE.search(name)
+        if m:
+            tok = m.group(1)
+            if tok in _SEASON_FA_ORDINALS:
+                words.add(_SEASON_FA_ORDINALS[tok])
+            else:
+                words.add(int(tok))
+        if len(words) == 1:
+            season = next(iter(words))
+    return SeasonInfo(season=season, episodes=episodes)
+
+
 # --- scoring ---------------------------------------------------------------
 
 def score_release(
     video_release: str,
     sub_release: str,
     weights: Optional[ScoreWeights] = None,
+    season_guard: bool = True,
 ) -> Tuple[int, bool]:
     """Score one (video release, subtitle release) pair.
 
-    Returns ``(score, episode_matched)``.  *episode_matched* is False when
-    both sides carry explicit S/E numbers that disagree - the pair must be
-    rejected in that case.  Point values come from *weights*
-    (:class:`ScoreWeights`, defaults used when ``None``).
+    Returns ``(score, episode_matched)``.  The pair is rejected (``-100``)
+    when the seasons disagree (word forms count too, e.g. a Season 1 pack
+    against a Season 2 video) or when both sides carry explicit episodes
+    and the video's episode lies outside the subtitle's span - an act pack
+    ``S02E01-E03`` matches episodes 1-3 and is rejected for episode 4.
+    Point values come from *weights* (:class:`ScoreWeights`, defaults used
+    when ``None``).
+
+    ``season_guard=False`` skips the season check; it is used for synthetic
+    ``ref`` fallback lines, whose title slug season is not trustworthy
+    (a site page named "...-first-season" can host uploads of any season).
     """
     w = _effective(weights)
-    v_se = extract_season_episode(video_release)
-    s_se = extract_season_episode(sub_release)
-    if v_se and s_se:
-        episode_ok = v_se == s_se
-        if not episode_ok:
+    v_info = season_info(video_release)
+    s_info = season_info(sub_release)
+    if (
+        season_guard
+        and v_info.season is not None
+        and s_info.season is not None
+        and v_info.season != s_info.season
+    ):
+        return -100, False
+    episode_ok = True
+    if v_info.episodes and s_info.episodes:
+        if v_info.episodes[1] < s_info.episodes[0] or v_info.episodes[0] > s_info.episodes[1]:
             return -100, False
-    else:
-        episode_ok = True
 
     v_tokens = set(tokens(video_release))
     s_tokens = set(tokens(sub_release))
@@ -185,29 +308,30 @@ def score_version(
 ) -> Optional[int]:
     """Score a subtitle version against a video release name.
 
-    ``None`` means "hard reject": every release line of the version carries
-    an explicit season/episode that disagrees with the video.  Otherwise the
-    best-scoring release line wins; versions with season-pack style releases
-    (no explicit episode) are kept as low-ranked fallbacks - they still
-    cover every episode of the season.
+    ``None`` means "hard reject": every release line of the version was
+    rejected (season or episode conflict).  Otherwise the best-scoring
+    release line wins; versions with season-pack style releases (no
+    explicit episode) are kept as low-ranked fallbacks - they still cover
+    every episode of their season, provided that season matches.
     """
     w = _effective(weights)
-    lines = version.releases or [version.ref]
+    trusted = bool(version.releases)  # ref fallback carries the page slug,
+    lines = version.releases or [version.ref]  # whose season is not reliable
     best: Optional[int] = None
     any_episode_line = False
     for line in lines:
-        s, ep_ok = score_release(video_release, line, w)
-        if extract_season_episode(line) or extract_episode(line):
+        s, ep_ok = score_release(video_release, line, w, season_guard=trusted)
+        if season_info(line).episodes is not None:
             any_episode_line = True
         if not ep_ok:
             continue
         if best is None or s > best:
             best = s
+    if best is None:
+        return None  # every line rejected (season / episode conflict)
     if not any_episode_line:
         # season pack / movie release: usable fallback, floored by weights
-        return max(w.season_pack_floor, best) if best is not None else w.season_pack_floor
-    if best is None:
-        return None  # explicit S/E everywhere, none matched
+        return max(w.season_pack_floor, best)
     best += w.episode_pin_bonus  # reward versions that pin the exact episode
     if version.rate == "positive":
         best += w.positive_rate_bonus

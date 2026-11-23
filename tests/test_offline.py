@@ -1364,3 +1364,213 @@ def test_download_url_skips_stale_uploads_but_keeps_the_rest(tmp_path, monkeypat
     monkeypatch.setattr(client, "download", all_dead)
     with pytest.raises(DownloadError):
         client.download_url("/subtitles/show", limit=3)
+
+
+# ---------------------------------------------------------------------------
+# season guard + episode ranges (v0.4.3)
+# (regression: the Arcane S2 run downloaded a Season 1 COMPLETE pack for six
+#  of nine episodes because season-only releases were never rejected, and
+#  act packs "S02E01-E03" were hard-rejected for every episode but the first)
+# ---------------------------------------------------------------------------
+
+def _ver(sub_id, releases, slug="arcane-league-of-legends-first-season"):
+    return SubtitleVersion(slug=slug, lang="english", sub_id=sub_id, releases=releases)
+
+
+def test_season_info_numeric_and_word_forms():
+    from pysubzone.scoring import season_info
+
+    assert season_info("Show.S02E05.1080p.WEB-DL").season == 2
+    assert season_info("Show.S02E05.1080p.WEB-DL").episodes == (5, 5)
+    assert season_info("Show.SEASON.01.S01.COMPLETE.1080p").season == 1
+    assert season_info("Show - Complete Season 1 - NF WEBRip").season == 1
+    assert season_info("Show - The Complete First Season").season == 1
+    assert season_info("Show - The Complete Second Season").season == 2
+    assert season_info("فصل دوم کامل").season == 2
+    assert season_info("فصل اول کامل").season == 1
+    # conflicting season tokens are ambiguous -> guard disabled, not guessed
+    assert season_info("Show.S01-S02.COMPLETE").season is None
+    # movies carry no season/episode tokens at all
+    movie = season_info("The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb")
+    assert movie.season is None and movie.episodes is None
+
+
+def test_season_info_ranges_and_alt_forms():
+    from pysubzone.scoring import season_info
+
+    assert season_info("Show.S02E01-E03.1080p.WEBRip").episodes == (1, 3)
+    assert season_info("Show.S01E07~E09.1080p.WEB-DL").episodes == (7, 9)
+    assert season_info("Show.S02E04-E05-E06.NF.WEBRip").episodes == (4, 6)
+    assert season_info("Show.S02EP01.LEAKED.AAC.H.264-4chan").episodes == (1, 1)
+    # a digit-leading release group after a dash is NOT an episode range
+    assert season_info("Show.S02E01.1080p.x265-2CH").episodes == (1, 1)
+    assert season_info("Show.S02E01.1080p.x265-4chan").episodes == (1, 1)
+    assert season_info("Show 2x05 1080p WEBRip").season == 2
+    assert season_info("Show 2x05 1080p WEBRip").episodes == (5, 5)
+    assert season_info("Show Season 2 Episode 5 1080p").season == 2
+    assert season_info("Show Season 2 Episode 5 1080p").episodes == (5, 5)
+
+
+def test_season_guard_rejects_s1_pack_for_s2_video():
+    from pysubzone.scoring import score_release, score_version
+
+    video = "Arcane.S02E02.Watch.It.All.Burn.1080p.WEBRip.10bit.DDP5.1.x265-HODL"
+    psa_lines = [
+        "Arcane.SEASON.01.S01.COMPLETE.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA",
+        "Arcane.SEASON.01.S01.COMPLETE.720p.10bit.WEBRip.2CH.x265.HEVC-PSA",
+    ]
+    score, ok = score_release(video, psa_lines[0])
+    assert score == -100 and ok is False
+    assert score_version(video, _ver("3561362", psa_lines)) is None
+
+
+def test_season_guard_keeps_same_season_pack():
+    from pysubzone.scoring import score_version
+
+    version = _ver("3561361", [
+        "Arcane.SEASON.02.S02.COMPLETE.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA",
+    ])
+    video = "Arcane.S01E03.1080p.WEBRip.10bit.DDP5.1.x265-HODL".replace("S01E03", "S02E03")
+    assert score_version(video, version) >= 40  # matching season pack stays a fallback
+
+
+def test_season_guard_word_and_persian_forms():
+    from pysubzone.scoring import score_release
+
+    video = "Show.S02E05.1080p.WEB-DL"
+    assert score_release(video, "Show - The Complete First Season")[0] == -100
+    assert score_release(video, "Show - Complete Season 1 - NF WEBRip")[0] == -100
+    assert score_release(video, "فصل اول کامل 1080p")[0] == -100
+    assert score_release(video, "Show.SEASON.02.COMPLETE.1080p")[0] >= 0
+    assert score_release("Show.S01E05.1080p.WEB-DL", "فصل اول کامل 1080p")[0] >= 0
+
+
+def test_season_guard_ambiguous_range_not_rejected():
+    from pysubzone.scoring import score_release
+
+    both = "Show.S01-S02.COMPLETE.1080p.WEB-DL"
+    assert score_release("Show.S01E05.1080p.WEB-DL", both)[0] >= 0
+    assert score_release("Show.S02E05.1080p.WEB-DL", both)[0] >= 0
+
+
+def test_season_guard_skipped_for_ref_fallback_line():
+    from pysubzone.scoring import score_version
+
+    # a version with no release lines falls back to "slug/lang/id"; the slug
+    # season ("first-season") must not reject Season 2 videos
+    version = SubtitleVersion(
+        slug="arcane-league-of-legends-first-season", lang="english", sub_id="9",
+        releases=[],
+    )
+    assert score_version("Arcane.S02E02.1080p.WEB-DL", version) is not None
+
+
+def test_episode_range_act_pack_matches_covered_episodes_only():
+    from pysubzone.scoring import score_release
+
+    pack = "Show.S02E01-E03.1080p.WEBRip"
+    for ep in ("S02E01", "S02E02", "S02E03"):
+        assert score_release(f"Show.{ep}.1080p.WEBRip.x265", pack)[0] >= 0
+    for ep in ("S02E04", "S02E05"):
+        assert score_release(f"Show.{ep}.1080p.WEBRip.x265", pack)[0] == -100
+
+
+def test_word_form_and_alt_form_videos_reject_wrong_season():
+    from pysubzone.scoring import score_release
+
+    video = "Arcane Season 2 Episode 1 1080p NF WEB-DL"
+    assert score_release(video, "Arcane.S01E09.480p.WEB-DL.RMT.GM")[0] == -100
+    assert score_release(video, "Arcane.S02E01.NF.WEBRip.1080p")[0] >= 0
+    video2 = "Arcane 2x01 1080p NF WEB-DL"
+    assert score_release(video2, "Arcane.S02E09.1080p.NF.WEB-DL")[0] == -100
+    assert score_release(video2, "Arcane.S02E01.1080p.NF.WEBRip")[0] >= 0
+
+
+def test_movie_matching_unaffected():
+    from pysubzone.scoring import score_release, score_version
+
+    video = "The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb"
+    sub = "The.Odyssey.2026.1080p.AMZN.WEB-DL.DDP5.1.Atmos.H.264-NTb"
+    assert score_release(video, sub)[0] >= 50
+    version = _ver("1", [sub], slug="the-odyssey-2026")
+    assert score_version(video, version) >= 50
+
+
+def test_movie_with_episode_word_title_still_matches():
+    from pysubzone.scoring import score_release
+
+    video = "Star.Wars.Episode.8.The.Last.Jedi.2017.1080p.BluRay"
+    sub = "Star.Wars.Episode.8.The.Last.Jedi.2017.2160p.BluRay"
+    assert score_release(video, sub)[0] >= 0
+
+
+def test_guess_title_cuts_word_form_season():
+    assert guess_title("Arcane Season 2 Episode 1 1080p NF WEB-DL") == "Arcane"
+    assert guess_title("Show.Name.SEASON.02.720p.WEBRip") == "Show Name"
+
+
+def test_guess_title_keeps_season_word_without_digits():
+    # "Season of the Witch" is a movie title - no season digits -> no cut
+    assert guess_title("Season.of.the.Witch.2010.1080p.BluRay") == "Season of the Witch"
+
+
+def test_arcane_s2_replay_never_picks_season_1():
+    """The exact live-data scenario that shipped wrong-season ZIPs (v0.4.3).
+
+    Release lines are the real upload rows of
+    /subtitles/arcane-league-of-legends-first-season/english at release time.
+    """
+    from pysubzone.scoring import rank_versions
+
+    versions = [
+        _ver("3554502", [
+            "Arcane.S02E01-E03.NF.WEBRip",
+            "Arcane.S02E01-E03.1080p.NF.WEBRip.DDP5.1.Atmos.x264-SuccessfulCrab",
+            "Arcane.S02E01-E03.720p.NF.WEB-DL.DDP5.1.Atmos.H.264",
+        ]),
+        _ver("3556509", [
+            "Arcane.S02E04-E05-E06.NF.WEBRip",
+            "Arcane.S02E04-E05-E06.1080p.NF.WEBRip.DDP5.1.Atmos.x264-SuccessfulCrab",
+        ]),
+        _ver("3558977", [
+            "Arcane.S02E07-E08-E09.NF.WEBRip",
+            "Arcane.S02E07-E08-E09.1080p.WEB.H264-SuccessfulCrab",
+        ]),
+        _ver("3559016", [
+            "Arcane.S02.NF.WEBRip",
+            "Arcane.S02.1080p.WEB.H264-SuccessfulCrab",
+            "Arcane.S02.720p.NF.WEB-DL.DDP5.1.Atmos.H.264",
+        ]),
+        _ver("3561362", [
+            "Arcane.SEASON.01.S01.COMPLETE.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA",
+            "Arcane.SEASON.01.S01.COMPLETE.720p.10bit.WEBRip.2CH.x265.HEVC-PSA",
+        ]),
+        _ver("3633501", ["Arcane - The Complete First Season"]),
+        _ver("3026864", ["Arcane - Complete Season 1 - NF WEBRip"]),
+        _ver("3547988", ["Arcane.League.of.Legends.S01.2021.ENGLISH.1080p.BluRay.H264.AAC-SWHA"]),
+        _ver("2615457", [
+            "Arcane.S01E01~E03.720p.NF.WEB-DL.DDP5.1.H.264-TEPES",
+            "Arcane.S01E01~E03.1080p.NF.WEB-DL.DDP5.1.H.264-TEPES",
+        ]),
+        _ver("2620546", ["Arcane.S01E04~E06.720p.NF.WEB-DL.DDP5.1.H.264-TEPES"]),
+        _ver("2625485", ["Arcane.S01E07~E09.720p.NF.WEB-DL.DDP5.1.H.264-TEPES"]),
+        _ver("2804595", ["Arcane.S01E01 - Welcome to the Playground"]),
+        _ver("2804599", ["Arcane.S01E05 - Everybody Wants to Be My Enemy"]),
+    ]
+    s2_ids = {"3554502", "3556509", "3558977", "3559016"}
+    stems = [
+        "Arcane.S02E01.Heavy.Is.the.Crown.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E02.Watch.It.All.Burn.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E03.Finally.Got.the.Name.Right.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E04.Paint.the.Town.Blue.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E05.Blisters.and.Bedrock.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E06.The.Message.Hidden.Within.the.Pattern.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E07.Pretend.Like.Its.the.First.Time.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E08.Killing.Is.a.Cycle.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        "Arcane.S02E09.The.Dirt.Under.Your.Nails.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+    ]
+    for stem in stems:
+        ranked = rank_versions(stem, versions)
+        assert ranked, f"no candidate for {stem}"
+        winner = ranked[0][1]
+        assert winner.sub_id in s2_ids, f"{stem} -> season-1 upload {winner.sub_id}"
