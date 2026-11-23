@@ -93,6 +93,23 @@ def find_videos(path: Path) -> List[Path]:
     raise FileNotFoundError(path)
 
 
+def resolve_out(out: Optional[Path], source: Optional[Path], out_cwd: bool = False) -> Optional[Path]:
+    """Resolve an output folder for the auto-match flows (CLI and TUI).
+
+    A relative *out* is created inside *source* (the videos folder), so that
+    ``-o subs`` / an output of ``subs`` collects subtitles in a ``subs`` folder
+    next to the videos.  Absolute paths are used unchanged, and
+    ``out_cwd=True`` resolves against the current directory instead.
+    ``None`` means no output folder was requested (caller falls back to its
+    own default).
+    """
+    if out is None:
+        return None
+    if out.is_absolute() or out_cwd or source is None:
+        return out
+    return (source / out).resolve()
+
+
 def subtitle_target(video: Path) -> Path:
     """Default subtitle file path for a video (same dir, .fa.srt)."""
     return video.with_suffix(".fa.srt")

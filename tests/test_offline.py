@@ -1,6 +1,7 @@
 """Offline tests: parsers, matcher and scoring run against saved HTML fixtures."""
 
 from pathlib import Path
+from typing import List, Optional
 
 import pytest
 
@@ -655,6 +656,39 @@ class _FakeClient:
         raise SubZoneError("offline test")
 
 
+class _WorkingClient:
+    """best_for_file + download succeed (or fail on demand), offline only."""
+
+    def __init__(self, download_error: Optional[Exception] = None) -> None:
+        self.download_error = download_error
+        self.downloads: List[dict] = []
+
+    def best_for_file(self, stem, lang=None, **k):
+        from pysubzone.models import SubtitleVersion, TitleResult
+
+        title = TitleResult(name="Show", slug="show", year=2024, subtitle_count=5)
+        version = SubtitleVersion(
+            slug="show",
+            lang="farsi_persian",
+            sub_id="7",
+            releases=[stem],
+            author="tester",
+        )
+        return title, version, 88
+
+    def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
+        from pysubzone.models import DownloadResult
+
+        if self.download_error is not None:
+            raise self.download_error
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        out = dest / f"{Path(target_video).with_suffix('').name}.fa.srt"
+        out.write_text("dummy", encoding="utf-8")
+        self.downloads.append({"dest": dest, "mode": save_mode, "video": target_video})
+        return DownloadResult(zip_path=None, srt_paths=[str(out)], version=version)
+
+
 def _run_async(coro):
     import asyncio
 
@@ -702,6 +736,122 @@ def test_tui_screens_switch_and_auto_dry_run(tmp_path, config_env):
             await pilot.pause()
 
     _run_async(scenario())
+
+
+def test_tui_auto_match_extract_saves_files(tmp_path, config_env):
+    """Regression for v0.4.2: 'Match & extract' failed on every video because
+    the TUI called the CLI-only _resolve_out (NameError -> row status 'error').
+    A relative output folder must be created inside the videos folder, exactly
+    like `subz auto -o subs` does."""
+    from pysubzone.tui import AutoScreen, SubZoneTUI
+    from textual.widgets import Button, Input
+
+    (tmp_path / "Show.S01E01.1080p.mkv").touch()
+    client = _WorkingClient()
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 44)) as pilot:
+            # Ctrl+A must reach the auto-match screen straight from search
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            screen = app.screen
+            screen.query_one("#auto-folder", Input).value = str(tmp_path)
+            screen.query_one("#auto-out", Input).value = "subs"
+            await pilot.pause()
+            screen.query_one("#auto-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert screen.matches[0]["status"] == "saved", screen.matches[0]
+            assert client.downloads and client.downloads[0]["mode"] == "extract"
+            # relative output resolved inside the videos folder, like the CLI
+            assert client.downloads[0]["dest"] == (tmp_path / "subs").resolve()
+            assert (tmp_path / "subs" / "Show.S01E01.1080p.fa.srt").is_file()
+
+    _run_async(scenario())
+
+
+def test_tui_auto_match_failed_row_shows_reason_on_enter(tmp_path, config_env):
+    """A failed download must not stay a bare 'error' - Enter on the failed
+    row prints the underlying message in the status line and keeps the user
+    on the auto screen."""
+    from pysubzone.tui import AutoScreen, SubZoneTUI
+    from textual.widgets import Button, Input, Static
+
+    (tmp_path / "Show.S01E01.1080p.mkv").touch()
+    client = _WorkingClient(download_error=RuntimeError("boom offline"))
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            screen = app.screen
+            screen.query_one("#auto-folder", Input).value = str(tmp_path)
+            await pilot.pause()
+            screen.query_one("#auto-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert screen.matches[0]["status"] == "error"
+            await pilot.press("enter")
+            await pilot.pause()
+            status_text = str(screen.query_one("#auto-status", Static).content)
+            assert "boom offline" in status_text
+            # stayed on the auto screen, no version list pushed
+            assert isinstance(app.screen, AutoScreen)
+
+    _run_async(scenario())
+
+
+def test_tui_ctrl_a_from_search_screen_keeps_typed_text(config_env):
+    """Ctrl+A must open auto-match straight from the search screen (not via
+    Browse first), and pressing it again must not wipe what was typed."""
+    from pysubzone.tui import AutoScreen, SearchScreen, SubZoneTUI
+    from textual.widgets import Input
+
+    async def scenario():
+        app = SubZoneTUI(_FakeClient())
+        async with app.run_test(size=(110, 44)) as pilot:
+            assert isinstance(app.screen, SearchScreen)
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            app.screen.query_one("#auto-folder", Input).value = "typed-folder"
+            await pilot.pause()
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            assert app.screen.query_one("#auto-folder", Input).value == "typed-folder"
+
+    _run_async(scenario())
+
+
+def test_tui_title_bar_shows_version(config_env):
+    """The header must show the running version next to the tagline."""
+    from pysubzone import __version__
+    from pysubzone.tui import SubZoneTUI
+
+    async def scenario():
+        app = SubZoneTUI(_FakeClient())
+        async with app.run_test(size=(80, 24)):
+            assert app.title == "PySubZone"
+            assert app.sub_title == f"subzone.ir subtitle downloader — v{__version__}"
+
+    _run_async(scenario())
+
+
+def test_resolve_out_shared_by_cli_and_tui():
+    """The v0.4.1 regression happened because the TUI re-implemented the
+    CLI's output resolution; both must use the very same helper."""
+    from pysubzone.cli import _resolve_out
+    from pysubzone.matcher import resolve_out
+    from pysubzone.tui import resolve_out
+
+    assert _resolve_out is resolve_out
+    assert _resolve_out is resolve_out
 
 
 def test_tui_download_dialog_has_rename_input(tmp_path, config_env):

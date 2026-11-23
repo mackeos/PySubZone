@@ -1,6 +1,7 @@
 """Textual TUI for PySubZone.
 
-Interactive screens (switch with Ctrl+S / Ctrl+B / Ctrl+A, quit with Ctrl+Q):
+Interactive screens (switch with Ctrl+S / Ctrl+B / Ctrl+A from anywhere,
+quit with Ctrl+Q):
 
     [SearchScreen]    type a query, Enter -> results table
          | Enter on a row
@@ -15,7 +16,8 @@ Interactive screens (switch with Ctrl+S / Ctrl+B / Ctrl+A, quit with Ctrl+Q):
 
     [AutoScreen]      the `subz auto` flow: scan a folder, match every
                       video, dry-run or download; Enter on a matched row
-                      opens its VersionsScreen to pick another upload
+                      opens its VersionsScreen, Enter on a failed row
+                      shows why it failed
 
     [BrowseScreen]    the `subz popular` flow: popular/latest uploads,
                       media-type + page filters; Enter opens the
@@ -34,6 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
@@ -46,10 +49,12 @@ from textual.widgets import (
     Static,
 )
 
+from . import __version__
 from .client import SubZoneClient
 from .config import load_tui_settings, save_tui_settings
 from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
+from .matcher import find_videos, resolve_out
 from .models import BrowseEntry, TitleResult
 
 
@@ -392,8 +397,6 @@ class AutoScreen(Screen):
         progress: ProgressBar,
         table: DataTable,
     ) -> None:
-        from .matcher import find_videos
-
         def ui(fn, *args, **kwargs) -> None:
             self.app.call_from_thread(fn, *args, **kwargs)
 
@@ -433,7 +436,9 @@ class AutoScreen(Screen):
                 if dry:
                     row["status"] = "dry run"
                 else:
-                    dest = _resolve_out(out_path, video.parent, False) or video.parent
+                    # a relative output folder lives inside the videos folder,
+                    # exactly like `subz auto -o` (resolve_out is shared with the CLI)
+                    dest = resolve_out(out_path, video.parent) or video.parent
                     result = self.client.download(
                         best,
                         dest_dir=dest,
@@ -441,7 +446,7 @@ class AutoScreen(Screen):
                         target_video=video,
                     )
                     row["status"] = "saved"
-                    row["detail"] = result.zip_path or ", ".join(result.srt_paths)
+                    row["detail"] = str(result.zip_path or ", ".join(result.srt_paths))
             except (NoSubtitleFoundError, TitleNotFoundError) as exc:
                 row["status"] = "not found"
                 row["detail"] = str(exc)
@@ -460,11 +465,14 @@ class AutoScreen(Screen):
             table.focus()
 
         ui(fill)
+        failed = sum(1 for r in self.matches if r["status"] in ("error", "not found"))
         if dry:
             summary = f"{total} video(s) matched (dry run)"
         else:
             saved = sum(1 for r in self.matches if r["status"] == "saved")
             summary = f"{saved}/{total} subtitle(s) saved"
+        if failed:
+            summary += f", {failed} failed - Enter on a failed row shows why"
         ui(
             status.update,
             f"[green]{summary}[/green] - Enter opens a matched title, r re-scans, Esc goes back",
@@ -479,6 +487,16 @@ class AutoScreen(Screen):
         if event.data_table.id != "auto-table":
             return
         index = event.cursor_row
+        if not (0 <= index < len(self.matches)):
+            return
+        row = self.matches[index]
+        if row["status"] in ("error", "not found"):
+            # failed rows explain themselves instead of opening a version list
+            self.query_one("#auto-status", Static).update(
+                f"[red]{row['video']}: {row['status']}[/red]"
+                f"{' - ' + row['detail'] if row['detail'] else ''}"
+            )
+            return
         if 0 <= index < len(self.title_results) and self.title_results[index]:
             self.app.push_screen(VersionsScreen(self.client, self.title_results[index]))
 
@@ -681,7 +699,10 @@ class SubZoneTUI(App):
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+s", "show_search", "Search"),
         ("ctrl+b", "show_browse", "Browse"),
-        ("ctrl+a", "show_auto", "Auto-match"),
+        # priority so the shortcut wins over the focused Input's own ctrl+a
+        # binding (cursor-home) - Auto-match must work from the search screen
+        # even while the query field has focus
+        Binding("ctrl+a", "show_auto", "Auto-match", priority=True),
     ]
 
     def __init__(self, client: SubZoneClient) -> None:
@@ -693,7 +714,7 @@ class SubZoneTUI(App):
 
     def on_mount(self) -> None:
         self.title = "PySubZone"
-        self.sub_title = "subzone.ir subtitle downloader"
+        self.sub_title = f"subzone.ir subtitle downloader — v{__version__}"
 
     async def _swap(self, screen: Screen) -> None:
         """Replace the current top-level screen.
@@ -707,11 +728,24 @@ class SubZoneTUI(App):
         else:
             await self.push_screen(screen)
 
+    async def _goto(self, screen: Screen, target_type: type) -> None:
+        """Swap to *screen* unless we are already there or a modal is open.
+
+        Re-entering the same screen (e.g. Ctrl+A while typing in the
+        auto-match screen) would otherwise recreate it and wipe whatever
+        the user had typed; a modal such as the download dialog must never
+        be yanked away by a screen switch either.
+        """
+        current = self.screen
+        if isinstance(current, target_type) or isinstance(current, ModalScreen):
+            return
+        await self._swap(screen)
+
     async def action_show_search(self) -> None:
-        await self._swap(SearchScreen(self.client))
+        await self._goto(SearchScreen(self.client), SearchScreen)
 
     async def action_show_browse(self) -> None:
-        await self._swap(BrowseScreen(self.client))
+        await self._goto(BrowseScreen(self.client), BrowseScreen)
 
     async def action_show_auto(self) -> None:
-        await self._swap(AutoScreen(self.client))
+        await self._goto(AutoScreen(self.client), AutoScreen)

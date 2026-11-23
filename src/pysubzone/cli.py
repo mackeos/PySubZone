@@ -46,6 +46,7 @@ from .config import (
 )
 from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
+from .matcher import resolve_out
 from .models import DownloadResult, TitleResult
 from .parsing import parse_subtitles_url
 from .scoring import rank_versions
@@ -124,20 +125,9 @@ def _fail(message: str, code: int) -> int:
     return code
 
 
-def _resolve_out(out: Optional[Path], source: Optional[Path], out_cwd: bool = False) -> Optional[Path]:
-    """Resolve -o/--out for the auto/filename commands.
-
-    A relative path is created inside *source* (the videos folder), so that
-    ``-o subs`` collects subtitles in a ``subs`` folder next to the videos.
-    Absolute paths are used unchanged, and ``out_cwd=True`` restores the old
-    behavior of resolving against the current directory.  ``None`` means no
-    output folder was requested (caller falls back to its own default).
-    """
-    if out is None:
-        return None
-    if out.is_absolute() or out_cwd or source is None:
-        return out
-    return (source / out).resolve()
+# Kept as an alias: the shared implementation lives in matcher.py and is
+# imported by the TUI too, so both auto-match flows resolve -o identically.
+_resolve_out = resolve_out
 
 
 def _is_slug_like(value: str) -> bool:

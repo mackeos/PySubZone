@@ -280,7 +280,7 @@ The TUI covers everything the CLI can do:
 1. **Search** — enter a query to see matching titles.
 2. **Versions** — select a title to browse its uploads, filter by language.
 3. **Download dialog** — pick a destination folder, optionally rename the output file in the *Save as* field, and choose to extract subtitles or keep the ZIP archive. A live progress bar tracks the download.
-4. **Auto-match** (`Ctrl+A`) — the `subz auto` flow: enter a folder, then dry-run or download matching subtitles for every video it contains. Selecting a matched row opens that title's version list, so you can pick another upload for a weak match.
+4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download matching subtitles for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
 5. **Browse** (`Ctrl+B`) — the `subz popular` flow: page through popular and latest uploads, filter by media type, and download directly.
 
 The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and auto-match screen come back pre-filled.
@@ -290,13 +290,15 @@ The last destination folder and language filter are remembered between sessions 
 | Key | Action |
 |---|---|
 | `Ctrl+S` | Search screen |
-| `Ctrl+A` | Auto-match screen |
+| `Ctrl+A` | Auto-match screen (works everywhere, even while typing) |
 | `Ctrl+B` | Browse screen |
 | `Esc` | Go back or close the current view |
 | `r` | Refresh versions / re-scan the folder |
 | `p` / `l` | Browse: popular / latest uploads |
 | `Left` / `Right` | Browse: previous / next page |
 | `Ctrl+Q` | Quit |
+
+The header always shows the running version next to the tagline (e.g. *PySubZone — subzone.ir subtitle downloader — v0.4.2*).
 
 ### TUI screenshots
 
