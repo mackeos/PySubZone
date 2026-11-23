@@ -361,3 +361,63 @@ def pick_best(
     """Single best version or ``None``."""
     ranked = rank_versions(video_release, versions, weights)
     return ranked[0] if ranked else None
+
+
+def covers_episodes(video_release: str, version: SubtitleVersion) -> bool:
+    """True when *version* plausibly contains the video's episode(s).
+
+    A release line covers the video when its season equals the video's
+    season (both must be explicitly known) and either its explicit episode
+    span contains the video's span (``S02E01-E03`` covers ``S02E02``) or it
+    names no episodes at all - a complete-season pack for that season.
+    Videos that do not pin a season and episode (movies, season folders)
+    are never covered, so ``--prefer-complete`` can never touch them.
+    """
+    v_info = season_info(video_release)
+    if v_info.episodes is None or v_info.season is None:
+        return False
+    lines = version.releases or [version.ref]
+    for line in lines:
+        l_info = season_info(line)
+        if l_info.season != v_info.season:
+            continue  # needs the same, explicitly known season
+        if l_info.episodes is None:
+            return True  # season pack for the video's season
+        if (
+            l_info.episodes[0] <= v_info.episodes[0]
+            and v_info.episodes[1] <= l_info.episodes[1]
+        ):
+            return True
+    return False
+
+
+def best_covering_version(
+    video_releases: List[str],
+    versions: List[SubtitleVersion],
+    weights: Optional[ScoreWeights] = None,
+) -> Optional[Tuple[int, SubtitleVersion]]:
+    """One version whose release lines cover *every* video, or ``None``.
+
+    Engine behind ``subz auto --prefer-complete``: when a complete-season
+    pack covers a whole folder of episodes, it is returned together with
+    the summed match score so the batch can be served from a single upload.
+    Candidates must cover every video (see :func:`covers_episodes`); the
+    highest total score wins.  Returns ``None`` for an empty video list or
+    when nothing covers them all.
+    """
+    if not video_releases:
+        return None
+    best: Optional[Tuple[int, SubtitleVersion]] = None
+    for version in versions:
+        total = 0
+        for stem in video_releases:
+            if not covers_episodes(stem, version):
+                break
+            s = score_version(stem, version, weights)
+            if s is None:
+                break
+            total += s
+        else:
+            if best is None or total > best[0]:
+                best = (total, version)
+    return best

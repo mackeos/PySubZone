@@ -49,7 +49,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import resolve_out
 from .models import DownloadResult, TitleResult
 from .parsing import parse_subtitles_url
-from .scoring import rank_versions
+from .scoring import best_covering_version, rank_versions, score_version, season_info
 
 app = typer.Typer(
     name="subz",
@@ -551,6 +551,7 @@ def auto(
     save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded zips instead of extracting them (default: config defaults.zip)."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
     no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt' (default: config defaults.no-suffix)."),
+    prefer_complete: Optional[bool] = typer.Option(None, "--prefer-complete/--no-prefer-complete", help="Prefer one same-season pack whose releases cover every episode video in the folder (e.g. a COMPLETE season zip); each video still gets its own episode extracted and renamed (default: config defaults.prefer-complete)."),
     min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum match score 0-100; lower-scoring videos are skipped (default: config defaults.min-score, 0 = accept every best match)."),
     parallel: Optional[int] = typer.Option(None, "--parallel", "-w", help="Download for this many videos concurrently, 1-8 (default: config defaults.workers)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Only show the matches, download nothing."),
@@ -570,6 +571,9 @@ def auto(
     save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
     lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
     no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
+    prefer_complete = bool(
+        prefer_complete if prefer_complete is not None else cfg.get("defaults.prefer-complete", False)
+    )
     try:
         videos = find_videos(path)
     except (ValueError, FileNotFoundError) as exc:
@@ -591,10 +595,47 @@ def auto(
 
     client = _client(ctx.obj)
 
+    # --prefer-complete: try to serve the whole folder from one same-season
+    # pack (e.g. a COMPLETE season zip).  Only episode videos with an
+    # explicitly pinned season AND episode participate; everything else
+    # (movies, season folders, unmatched titles) keeps its own per-video
+    # best.  A planning failure must never break the normal flow.
+    planned: Dict[Path, tuple] = {}
+    if prefer_complete:
+        try:
+            episode_videos = [
+                v for v in videos
+                if season_info(v.name).episodes is not None
+                and season_info(v.name).season is not None
+            ]
+            grouped: Dict[str, list] = {}
+            titles_by_slug: Dict[str, Any] = {}
+            for video in episode_videos:
+                title, _best, _score = client.best_for_file(video.stem, lang=lang_slug)
+                grouped.setdefault(title.slug, []).append(video)
+                titles_by_slug[title.slug] = title
+            for slug, group in grouped.items():
+                versions = client.title_versions(slug, lang_slug)
+                covering = best_covering_version([v.name for v in group], versions)
+                if covering is None:
+                    continue
+                _total, pack = covering
+                for video in group:
+                    s = score_version(video.name, pack)
+                    if s is not None:
+                        planned[video] = (titles_by_slug[slug], pack, s)
+        except Exception as exc:  # noqa: BLE001 - planning is best-effort
+            if not json_out and map_json != "-":
+                console.print(f"[dim]prefer-complete planning skipped: {exc}[/dim]")
+
     def _match_one(video: Path) -> Dict[str, Any]:
         row: Dict[str, Any] = {"video": str(video), "title": None, "status": "ok"}
         try:
-            title, best, score = client.best_for_file(video.stem, lang=lang_slug)
+            if video in planned:
+                title, best, score = planned[video]
+                row["mode"] = "complete-pack"
+            else:
+                title, best, score = client.best_for_file(video.stem, lang=lang_slug)
             row.update({"title": title.name, "ref": best.ref, "score": score})
             if score < min_score:
                 row["status"] = "skipped"

@@ -1574,3 +1574,275 @@ def test_arcane_s2_replay_never_picks_season_1():
         assert ranked, f"no candidate for {stem}"
         winner = ranked[0][1]
         assert winner.sub_id in s2_ids, f"{stem} -> season-1 upload {winner.sub_id}"
+
+
+# ---------------------------------------------------------------------------
+# pack-member selection + --prefer-complete (v0.4.4)
+# (an E01 video matched to an E01-E03 pack used to write THREE files all
+#  named after the video: <stem>.en.2.srt held episode 2's lines, etc.)
+# ---------------------------------------------------------------------------
+
+def _zip_payload_with_contents(members):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in members.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def test_extract_filters_pack_member_for_episode_video(tmp_path):
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload_with_contents({
+        "Show.S02E02.en.srt": "E02 lines",
+        "Show.S02E01.en.srt": "E01 lines",
+        "Show.S02E03.en.srt": "E03 lines",
+    })
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Show.S02E01.1080p.WEBRip.x265.mkv",
+    )
+    assert [p.name for p in written] == ["Show.S02E01.1080p.WEBRip.x265.en.srt"]
+    assert written[0].read_text(encoding="utf-8") == "E01 lines"
+
+
+def test_extract_member_filter_word_form_video(tmp_path):
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload_with_contents({
+        "Show.S02E01.en.srt": "E01 lines",
+        "Show.S02E02.en.srt": "E02 lines",
+    })
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Show Season 2 Episode 2 1080p.mkv",
+    )
+    assert [p.name for p in written] == ["Show Season 2 Episode 2 1080p.en.srt"]
+    assert written[0].read_text(encoding="utf-8") == "E02 lines"
+
+
+def test_extract_filter_falls_back_when_members_untagged(tmp_path):
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="farsi_persian", sub_id="42")
+    payload = _zip_payload(["cd1.srt", "cd2.srt"])
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "fa", target_video="Arcane.S02E01.mkv"
+    )
+    assert sorted(p.name for p in written) == [
+        "Arcane.S02E01.fa.1.srt",
+        "Arcane.S02E01.fa.2.srt",
+    ]
+
+
+def test_extract_no_filter_for_movie_or_season_video(tmp_path):
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload([
+        "Show.S02E01.en.srt", "Show.S02E02.en.srt", "Show.S02E03.en.srt",
+    ])
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Some.Movie.2023.1080p.BluRay.mkv",
+    )
+    assert len(written) == 3  # movies pin no episode -> numbered, unchanged
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Show.S02.1080p.WEBRip.mkv",
+    )
+    assert len(written) == 3  # season-folder video pins no episode either
+
+
+def test_extract_wrong_season_member_not_selected(tmp_path):
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload_with_contents({
+        "Show.S01E01.en.srt": "S1E01 lines",
+        "Show.S01E02.en.srt": "S1E02 lines",
+        "Show.S02E01.en.srt": "S2E01 lines",
+    })
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Show.S02E01.1080p.WEBRip.mkv",
+    )
+    assert [p.name for p in written] == ["Show.S02E01.1080p.WEBRip.en.srt"]
+    assert written[0].read_text(encoding="utf-8") == "S2E01 lines"
+
+
+def test_zip_mode_keeps_full_pack(tmp_path, monkeypatch):
+    from pysubzone.client import SubZoneClient
+
+    class _FakeResponse:
+        headers: dict = {}
+
+        def iter_content(self, chunk_size=None):
+            yield _zip_payload([
+                "Show.S02E01.en.srt", "Show.S02E02.en.srt", "Show.S02E03.en.srt",
+            ])
+
+    client = SubZoneClient()
+    monkeypatch.setattr(client, "_get", lambda *a, **k: _FakeResponse())
+    version = SubtitleVersion(
+        slug="show", lang="english", sub_id="42",
+        releases=["Show.S02E01-E03.1080p.WEBRip"],
+    )
+    result = client.download(
+        version, dest_dir=tmp_path, save_mode="zip",
+        target_video="Show.S02E01.1080p.WEBRip.mkv",
+    )
+    import zipfile as _zipfile
+
+    with _zipfile.ZipFile(result.zip_path) as zf:
+        assert sorted(zf.namelist()) == [
+            "Show.S02E01.en.srt", "Show.S02E02.en.srt", "Show.S02E03.en.srt",
+        ]
+
+
+def test_covers_episodes_rules():
+    from pysubzone.scoring import covers_episodes
+
+    season_pack = _ver("100", ["Arcane.Season2.COMPLETE.1080p.WEB-DL.DDP5.1.Atmos.x264"])
+    span_pack = _ver("101", ["Arcane.S02E01-E09.1080p.WEB-DL"])
+    act_pack = _ver("102", ["Arcane.S02E01-E03.1080p.WEBRip"])
+    s1_pack = _ver("103", ["Arcane.SEASON.01.S01.COMPLETE.1080p.WEBRip"])
+    untagged = _ver("104", ["Show.1080p.WEBRip"])
+
+    ep5 = "Show.S02E05.1080p.WEB-DL"
+    assert covers_episodes(ep5, season_pack)   # same-season COMPLETE pack
+    assert covers_episodes(ep5, span_pack)     # span contains the episode
+    assert not covers_episodes(ep5, act_pack)  # span stops at E03
+    assert not covers_episodes(ep5, s1_pack)   # wrong season
+    assert not covers_episodes(ep5, untagged)  # no season, no episodes
+    assert not covers_episodes("Some.Movie.2023.1080p.BluRay", season_pack)
+    assert not covers_episodes("Show.S02.1080p.WEBRip", season_pack)  # no pinned episode
+
+
+def test_best_covering_version_picks_one_pack_for_all():
+    from pysubzone.scoring import best_covering_version
+
+    season_pack = _ver("100", [
+        "Arcane.Season2.COMPLETE.1080p.WEB-DL.DDP5.1.Atmos.x264",
+        "Arcane.Season2.COMPLETE.720p.WEB-DL",
+    ])
+    span_pack = _ver("101", ["Arcane.S02E01-E09.1080p.WEB-DL"])
+    act_pack = _ver("102", ["Arcane.S02E01-E03.1080p.WEBRip"])
+    s1_pack = _ver("103", ["Arcane.SEASON.01.S01.COMPLETE.1080p.WEBRip"])
+    stems = [f"Show.S02E0{i}.1080p.WEB-DL" for i in (1, 2, 3)]
+    best = best_covering_version(stems, [act_pack, s1_pack, span_pack, season_pack])
+    assert best is not None
+    assert best[1].sub_id in {"100", "101"}
+    assert best_covering_version(["Some.Movie.2023.1080p.BluRay"], [season_pack]) is None
+    assert best_covering_version([], [season_pack]) is None
+
+
+def _auto_pack_stub_client():
+    from pysubzone.models import DownloadResult, TitleResult
+
+    downloads = []
+
+    class _StubClient:
+        def best_for_file(self, stem, lang=None):
+            return (
+                TitleResult(name="Show", slug="show-season-2", url=""),
+                SubtitleVersion(
+                    slug="show-season-2", lang="english", sub_id="7",
+                    releases=["Show.S02E01-E03.1080p.WEBRip"], author="t",
+                ),
+                55,
+            )
+
+        def title_versions(self, slug, lang):
+            return [
+                SubtitleVersion(
+                    slug="show-season-2", lang="english", sub_id="7",
+                    releases=["Show.S02E01-E03.1080p.WEBRip"], author="t",
+                ),
+                SubtitleVersion(
+                    slug="show-season-2", lang="english", sub_id="9",
+                    releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="t",
+                ),
+            ]
+
+        def download(self, target, **kwargs):
+            downloads.append((target, kwargs))
+            name = Path(kwargs["target_video"]).stem
+            return DownloadResult(
+                zip_path=None,
+                srt_paths=[f"/tmp/{name}.en.srt"],
+                version=target, bytes_downloaded=100,
+            )
+
+    return _StubClient(), downloads
+
+
+def test_cli_auto_prefer_complete_uses_pack_for_episodes(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E02.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Some.Movie.2023.1080p.BluRay.mkv").touch()
+    stub, downloads = _auto_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(
+        app,
+        ["auto", str(tmp_path), "-y", "--prefer-complete", "--map-json", "-"],
+    )
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    rows = {Path(r["video"]).name: r for r in data["results"]}
+    ep1 = rows["Show.S02E01.1080p.WEBRip.mkv"]
+    ep2 = rows["Show.S02E02.1080p.WEBRip.mkv"]
+    ep5 = rows["Show.S02E05.1080p.WEBRip.mkv"]
+    movie = rows["Some.Movie.2023.1080p.BluRay.mkv"]
+    # the E01-E03 act pack cannot cover E05, so the COMPLETE pack wins for all
+    # episode videos (sub_id 9)
+    assert ep1["mode"] == "complete-pack" and ep1["ref"].endswith("/9")
+    assert ep2["mode"] == "complete-pack" and ep2["ref"].endswith("/9")
+    assert ep5["mode"] == "complete-pack" and ep5["ref"].endswith("/9")
+    # the movie keeps its own per-video best (sub_id 7), no mode marker
+    assert "mode" not in movie and movie["ref"].endswith("/7")
+    assert {d[0].sub_id for d in downloads} == {"7", "9"}
+    assert len(downloads) == 4
+
+
+def test_cli_auto_prefer_complete_via_config(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    stub, _downloads = _auto_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    runner = _runner()
+    set_result = runner.invoke(app, ["config", "set", "defaults.prefer-complete", "true"])
+    assert set_result.exit_code == 0, set_result.output
+
+    result = runner.invoke(app, ["auto", str(tmp_path), "-y", "--map-json", "-"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    assert data["results"][0]["mode"] == "complete-pack"
+
+
+def test_cli_auto_without_flag_keeps_per_video_best(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E02.1080p.WEBRip.mkv").touch()
+    stub, _downloads = _auto_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(app, ["auto", str(tmp_path), "-y", "--map-json", "-"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    for row in data["results"]:
+        assert "mode" not in row
+        assert row["ref"].endswith("/7")

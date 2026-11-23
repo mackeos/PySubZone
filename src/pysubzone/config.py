@@ -46,6 +46,7 @@ CONFIG_SPEC: Dict[str, Tuple[str, type, str]] = {
     "defaults.lang-suffix": ("defaults", str, "Language suffix for extracted files (empty = auto)."),
     "defaults.no-suffix": ("defaults", bool, "Name files Movie.srt instead of Movie.fa.srt."),
     "defaults.min-score": ("defaults", int, "Minimum auto-match score 0-100 (0 = accept every best match)."),
+    "defaults.prefer-complete": ("defaults", bool, "Prefer one same-season pack covering all episode videos in `subz auto` (--prefer-complete)."),
     "defaults.workers": ("defaults", int, "Parallel downloads for `subz auto` (1-8)."),
     "network.base-url": ("network", str, "Site base URL."),
     "network.user-agent": ("network", str, "HTTP User-Agent header."),

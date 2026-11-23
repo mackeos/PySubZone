@@ -207,6 +207,8 @@ subz auto /media/shows -l fa -o subs --out-cwd
 
 For each video, the release name is parsed for details such as the title, season and episode, resolution, source, and release group. Subtitle versions are rejected when their season disagrees with the video's (word forms like "Complete First Season" or "فصل دوم" count too), when their explicit episode span does not cover the video (an act pack `S02E01-E03` matches episodes 1-3 only), or when pinned episode numbers conflict. Exact release matches are preferred, and season packs of the *same* season can be used as fallbacks.
 
+Multi-episode packs are handled member-aware: when the video pins an episode (`SxxEyy`) and the chosen upload is a pack whose member files carry their own episode tags (an `E01-E03` zip containing `...E01.srt`, `...E02.srt`, `...E03.srt`), extraction writes only the member matching the video - one correctly named file instead of three numbered copies that all carry the video's name. Untagged members, movies and season-folder videos keep the previous numbered behavior, and `--zip` mode always stores the full original archive.
+
 The output folder is controlled by `-o/--out`. A **relative** path is created **inside the videos folder** (each video's own folder), so `-o subs` collects subtitles in a `subs` folder next to the videos. An **absolute** path is used exactly as given. Without `-o`, subtitles are saved beside each video. To resolve relative paths against the current directory instead (the behavior up to v0.1.1), pass `--out-cwd`.
 
 Quality and speed controls:
@@ -215,6 +217,8 @@ Quality and speed controls:
 - `--parallel N` (or `-w`) — download for up to `N` videos concurrently (1-8). The default is sequential.
 
 Both options can also be set permanently in the [config file](#configuration-file) as `defaults.min-score` and `defaults.workers`.
+
+- `--prefer-complete` — opt-in batch mode: when one same-season pack covers **every** episode video in the folder (e.g. a `COMPLETE` season zip whose release lines name the folder's season), it is preferred for all of them and each video still receives its own episode extracted and renamed. Movies and videos without a pinned season/episode are never touched. Off by default; set permanently as `defaults.prefer-complete`.
 
 For scripting, `--map-json` writes the complete per-video result map — every match, score, status and saved path, plus a summary — as JSON:
 

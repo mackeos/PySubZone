@@ -42,7 +42,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import guess_title, guess_season_episode
 from .models import DownloadResult, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
 from .parsing import parse_search, parse_subtitles_url, parse_subtitle_page, parse_title
-from .scoring import ScoreWeights, pick_best
+from .scoring import ScoreWeights, pick_best, season_info
 
 DEFAULT_BASE_URL = "https://subzone.ir"
 DEFAULT_USER_AGENT = (
@@ -636,6 +636,41 @@ class SubZoneClient:
             raise InvalidURLError(f"subtitle id must be numeric, got {sub_id!r}")
         return slug, lang, sub_id
 
+    @staticmethod
+    def _select_episode_members(members: List[str], target_video: Optional[Union[str, Path]]) -> List[str]:
+        """Keep only the pack members that carry the video's own episode.
+
+        Auto-match can hand a multi-episode pack (``S02E01-E03``) to a single
+        episode video; extracting every member would name them all after the
+        video (``<stem>.en.2.srt`` holding episode 2's lines).  When the
+        video pins an episode (``SxxEyy``) and member names carry their own
+        episode tags, only matching members are written.  Anything ambiguous
+        - video without a pinned episode, untagged member names, no match -
+        keeps the previous behaviour (all members, numbered).
+        """
+        if target_video is None or len(members) <= 1:
+            return members
+        v_info = season_info(Path(target_video).name)
+        if v_info.episodes is None:
+            return members
+        matched: List[str] = []
+        for member in members:
+            m_info = season_info(Path(member).name)
+            if m_info.episodes is None:
+                continue
+            if (
+                v_info.season is not None
+                and m_info.season is not None
+                and m_info.season != v_info.season
+            ):
+                continue
+            if (
+                m_info.episodes[0] <= v_info.episodes[1]
+                and v_info.episodes[0] <= m_info.episodes[1]
+            ):
+                matched.append(member)
+        return matched if matched and len(matched) < len(members) else members
+
     def _extract_subtitles(
         self,
         payload: bytes,
@@ -661,6 +696,8 @@ class SubZoneClient:
                 f"{', '.join(archive.namelist()[:6]) or 'empty archive'}"
             )
 
+        members = self._select_episode_members(sorted(members), target_video)
+
         if base_name:
             base = _sanitize_base_name(base_name)
         elif target_video is not None:
@@ -673,7 +710,7 @@ class SubZoneClient:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         written: List[Path] = []
-        for index, member in enumerate(sorted(members), start=1):
+        for index, member in enumerate(members, start=1):
             ext = Path(member).suffix.lower()
             if len(members) == 1:
                 stem = f"{base}.{suffix}" if suffix else str(base)
