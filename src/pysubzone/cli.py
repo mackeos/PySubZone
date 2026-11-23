@@ -10,6 +10,7 @@ results: every command accepts ``--json`` and uses stable exit codes
     subz url https://subzone.ir/subtitles/the-odyssey-2026 -n 2
     subz filename Dexter.Resurrection.S02E01.1080p.AMZN.WEB-DL-NTb.mkv
     subz auto /media/shows --dry-run
+    subz config set defaults.min-score 60
     subz tui
 """
 
@@ -33,6 +34,13 @@ from rich.progress import (
 from rich.table import Table
 
 from .client import DEFAULT_BASE_URL, DEFAULT_USER_AGENT, SubZoneClient
+from .config import (
+    CONFIG_SPEC,
+    config_path,
+    load_config,
+    set_config_value,
+    unset_config_value,
+)
 from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .models import DownloadResult, TitleResult
@@ -72,12 +80,19 @@ class Settings:
         timeout: float,
         retries: int,
         verbose: bool,
+        config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.base_url = base_url
         self.user_agent = user_agent
         self.timeout = timeout
         self.retries = retries
         self.verbose = verbose
+        self.config: Dict[str, Any] = config or {}
+
+
+def _cfg(settings: Settings, key: str, fallback: Any) -> Any:
+    """Config-file value for *key*, falling back when it is not set."""
+    return settings.config.get(key, fallback)
 
 
 def _client(settings: Settings) -> SubZoneClient:
@@ -157,14 +172,14 @@ def search(
     ctx: typer.Context,
     query: str = typer.Argument(..., help="Show or movie title to look for."),
     lang: Optional[str] = typer.Option(
-        None, "--lang", "-l", help="Only titles having subtitles in this language (fa, en, tr, ...)."
+        None, "--lang", "-l", help="Only titles having subtitles in this language (default: config defaults.language)."
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
 ) -> None:
     """Search subzone.ir for movie/series titles."""
     client = _client(ctx.obj)
     try:
-        results = client.search(query, lang=lang)
+        results = client.search(query, lang=lang or _cfg(ctx.obj, "defaults.language", None))
     except TitleNotFoundError:
         if json_out:
             _emit([], True)
@@ -204,7 +219,7 @@ def versions(
     ctx: typer.Context,
     title: str = typer.Argument(..., help="Title slug (dexter-resurrection-season-2) or a show name."),
     lang: Optional[str] = typer.Option(
-        None, "--lang", "-l", help="Only list versions in this language."
+        None, "--lang", "-l", help="Only list versions in this language (default: config defaults.language)."
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON instead of a table."),
 ) -> None:
@@ -212,7 +227,7 @@ def versions(
     client = _client(ctx.obj)
     try:
         resolved = _resolve_title_arg(client, title)
-        version_list = client.title_versions(resolved.slug, lang)
+        version_list = client.title_versions(resolved.slug, lang or _cfg(ctx.obj, "defaults.language", None))
     except (TitleNotFoundError, NoSubtitleFoundError) as exc:
         raise typer.Exit(_fail(str(exc), EXIT_NOT_FOUND))
     except SubZoneError as exc:
@@ -285,28 +300,25 @@ def _download_impl(
     return client.download_url(f"/subtitles/{slug}", lang=effective_lang, limit=limit, **kwargs)
 
 
-def _shared_download_options(out: Path = None):
-    return {
-        "out": typer.Option(Path("."), "--out", "-o", help="Output directory (default: current directory)."),
-        "save_zip": typer.Option(False, "--zip", help="Keep the downloaded zip instead of extracting it."),
-        "lang_suffix": typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa' (default: derived from language)."),
-        "no_suffix": typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
-    }
-
-
 @app.command()
 def download(
     ctx: typer.Context,
     target: str = typer.Argument(..., help="'<slug>/<lang>/<id>' ref, any subzone.ir URL, or a title slug."),
-    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Language for title slugs/URLs (default: farsi_persian)."),
+    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Language for title slugs/URLs (default: config defaults.language or farsi_persian)."),
     limit: int = typer.Option(1, "--limit", "-n", help="How many versions to grab from title slugs/URLs (0 = all)."),
-    out: Path = typer.Option(Path("."), "--out", "-o", help="Output directory (default: current directory)."),
-    save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zip instead of extracting it."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output directory (default: current directory, or config defaults.out)."),
+    save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded zip instead of extracting it (default: config defaults.zip)."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa' (default: derived from language)."),
-    no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
+    no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt' (default: config defaults.no-suffix)."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
     """Download a subtitle by ref, URL or title slug."""
+    cfg = ctx.obj.config
+    out = out if out is not None else Path(_cfg(ctx.obj, "defaults.out", ".") or ".")
+    save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
+    lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
+    no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
+    lang = lang or _cfg(ctx.obj, "defaults.language", None)
     client = _client(ctx.obj)
     try:
         results = _download_impl(client, target, lang, limit, out, save_zip, lang_suffix, no_suffix)
@@ -326,15 +338,21 @@ def download(
 def url(
     ctx: typer.Context,
     url_value: str = typer.Argument(..., help="Any subzone.ir subtitles URL (version or title page)."),
-    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Language for title URLs (default: farsi_persian)."),
+    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Language for title URLs (default: config defaults.language or farsi_persian)."),
     limit: int = typer.Option(1, "--limit", "-n", help="How many versions to grab from title URLs (0 = all)."),
-    out: Path = typer.Option(Path("."), "--out", "-o", help="Output directory (default: current directory)."),
-    save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zip instead of extracting it."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output directory (default: current directory, or config defaults.out)."),
+    save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded zip instead of extracting it (default: config defaults.zip)."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
-    no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
+    no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt' (default: config defaults.no-suffix)."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
     """'URL grab': paste any subzone.ir subtitles URL and download it."""
+    cfg = ctx.obj.config
+    out = out if out is not None else Path(_cfg(ctx.obj, "defaults.out", ".") or ".")
+    save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
+    lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
+    no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
+    lang = lang or _cfg(ctx.obj, "defaults.language", None)
     client = _client(ctx.obj)
     try:
         results = _download_impl(client, url_value, lang, limit, out, save_zip, lang_suffix, no_suffix)
@@ -358,27 +376,34 @@ def url(
 def filename(
     ctx: typer.Context,
     file: str = typer.Argument(..., help="Video file path or release name."),
-    lang: Optional[str] = typer.Option(DEFAULT_LANGUAGE, "--lang", "-l", help="Subtitle language."),
-    out: Path = typer.Option(Path("."), "--out", "-o", help="Output folder (relative: inside the video's folder; absolute: as-is; default: beside the video)."),
+    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Subtitle language (default: config defaults.language or farsi_persian)."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output folder (relative: inside the video's folder; absolute: as-is; default: beside the video, or config defaults.out)."),
     out_cwd: bool = typer.Option(False, "--out-cwd", help="Resolve a relative --out against the current directory instead of the video's folder."),
-    save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zip instead of extracting it."),
+    save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded zip instead of extracting it (default: config defaults.zip)."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
-    no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
+    no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt' (default: config defaults.no-suffix)."),
     no_download: bool = typer.Option(False, "--no-download", help="Only show matching candidates."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum match score 0-100 to accept the best version (default: config defaults.min-score, 0 = accept every best match)."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
     """Find the best subtitle for one video file / release name."""
     from .matcher import guess_season_episode, guess_title
 
     client = _client(ctx.obj)
+    cfg = ctx.obj.config
     stem = Path(file).stem
     query = guess_title(stem)
-    lang_slug = resolve(lang) or DEFAULT_LANGUAGE
+    lang_slug = resolve(lang or _cfg(ctx.obj, "defaults.language", None)) or DEFAULT_LANGUAGE
     real_file = Path(file).is_file()
     # Relative -o paths are created inside the video's folder; absolute paths
     # are used as-is; --out-cwd restores current-directory-relative behavior.
     source = Path(file).parent if real_file else None
-    dest_dir = _resolve_out(out, source, out_cwd) or (source or Path("."))
+    out_value = out if out is not None else (Path(cfg["defaults.out"]) if cfg.get("defaults.out") else Path("."))
+    dest_dir = _resolve_out(out_value, source, out_cwd) or (source or Path("."))
+    min_score = int(min_score if min_score is not None else cfg.get("defaults.min-score", 0))
+    save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
+    lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
+    no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
     if not json_out:
         console.print(
             f"[dim]query:[/dim] [bold]{query}[/bold]   "
@@ -401,7 +426,13 @@ def filename(
             "best": {**best.as_dict(), "score": score},
             "candidates": [{"score": s, **v.as_dict()} for s, v in ranked],
         }
-        if not no_download:
+        if not no_download and score < min_score:
+            payload["skipped"] = (
+                f"best score {score} is below min-score {min_score}"
+            )
+            _emit(payload, True)
+            raise typer.Exit(EXIT_NOT_FOUND)
+        elif not no_download:
             result = client.download(
                 best,
                 dest_dir=dest_dir,
@@ -433,6 +464,14 @@ def filename(
 
     if no_download:
         return
+    if score < min_score:
+        raise typer.Exit(
+            _fail(
+                f"best score {score} is below min-score {min_score}; nothing downloaded "
+                "(lower --min-score to accept this match)",
+                EXIT_NOT_FOUND,
+            )
+        )
     try:
         result = client.download(
             best,
@@ -455,12 +494,14 @@ def filename(
 def auto(
     ctx: typer.Context,
     path: Path = typer.Argument(..., help="Video file or a folder containing videos."),
-    lang: Optional[str] = typer.Option(DEFAULT_LANGUAGE, "--lang", "-l", help="Subtitle language."),
-    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output folder for subtitles (relative: inside the videos folder; absolute: as-is)."),
+    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Subtitle language (default: config defaults.language or farsi_persian)."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output folder for subtitles (relative: inside the videos folder; absolute: as-is; default: beside each video, or config defaults.out)."),
     out_cwd: bool = typer.Option(False, "--out-cwd", help="Resolve a relative --out against the current directory instead of the videos folder."),
-    save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zips instead of extracting them."),
+    save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded zips instead of extracting them (default: config defaults.zip)."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
-    no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
+    no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt' (default: config defaults.no-suffix)."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum match score 0-100; lower-scoring videos are skipped (default: config defaults.min-score, 0 = accept every best match)."),
+    parallel: Optional[int] = typer.Option(None, "--parallel", "-w", help="Download for this many videos concurrently, 1-8 (default: config defaults.workers)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Only show the matches, download nothing."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
@@ -468,7 +509,15 @@ def auto(
     """Auto-match every video in PATH and download fitting subtitles."""
     from .matcher import find_videos
 
-    lang_slug = resolve(lang) or DEFAULT_LANGUAGE
+    cfg = ctx.obj.config
+    lang_slug = resolve(lang or _cfg(ctx.obj, "defaults.language", None)) or DEFAULT_LANGUAGE
+    out_value = out if out is not None else (Path(cfg["defaults.out"]) if cfg.get("defaults.out") else None)
+    min_score = int(min_score if min_score is not None else cfg.get("defaults.min-score", 0))
+    workers = int(parallel if parallel is not None else cfg.get("defaults.workers", 1))
+    workers = max(1, min(8, workers))
+    save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
+    lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
+    no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
     try:
         videos = find_videos(path)
     except (ValueError, FileNotFoundError) as exc:
@@ -481,15 +530,43 @@ def auto(
         for v in videos:
             console.print(f"  [dim]-[/dim] {v.name}")
         note = "  [dim](dry run)[/dim]" if dry_run else ""
+        if workers > 1:
+            note += f"  [dim](parallel x{workers})[/dim]"
         console.print(f"[dim]language: {display_name(lang_slug)}{note}[/dim]")
         if not dry_run and not yes and sys.stdin.isatty():
             if not typer.confirm("Fetch and save subtitles for these files?"):
                 return
 
     client = _client(ctx.obj)
-    rows: List[Dict[str, Any]] = []
-    saw_error = False
-    saw_missing = False
+
+    def _match_one(video: Path) -> Dict[str, Any]:
+        row: Dict[str, Any] = {"video": str(video), "title": None, "status": "ok"}
+        try:
+            title, best, score = client.best_for_file(video.stem, lang=lang_slug)
+            row.update({"title": title.name, "ref": best.ref, "score": score})
+            if score < min_score:
+                row["status"] = "skipped"
+                row["error"] = f"score {score} is below min-score {min_score}"
+            elif dry_run:
+                row["status"] = "dry-run"
+            else:
+                dest = _resolve_out(out_value, video.parent, out_cwd) or video.parent
+                result = client.download(
+                    best,
+                    dest_dir=dest,
+                    save_mode="zip" if save_zip else "extract",
+                    lang_suffix=lang_suffix,
+                    no_suffix=no_suffix,
+                    target_video=video,
+                )
+                row["saved"] = result.srt_paths or result.zip_path
+        except (NoSubtitleFoundError, TitleNotFoundError) as exc:
+            row["status"] = "not found"
+            row["error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - one bad video must not stop the batch
+            row["status"] = "error"
+            row["error"] = str(exc)
+        return row
 
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -499,37 +576,22 @@ def auto(
         console=console,
         disable=json_out,
     )
+    rows: List[Dict[str, Any]] = [None] * len(videos)  # type: ignore[list-item]
     with progress:
         task = progress.add_task("matching", total=len(videos))
-        for video in videos:
-            progress.update(task, description=f"[cyan]{video.name[:40]}")
-            row: Dict[str, Any] = {"video": str(video), "title": None, "status": "ok"}
-            try:
-                title, best, score = client.best_for_file(video.stem, lang=lang_slug)
-                row.update({"title": title.name, "ref": best.ref, "score": score})
-                if dry_run:
-                    row["status"] = "dry-run"
-                else:
-                    dest = _resolve_out(out, video.parent, out_cwd) or video.parent
-                    result = client.download(
-                        best,
-                        dest_dir=dest,
-                        save_mode="zip" if save_zip else "extract",
-                        lang_suffix=lang_suffix,
-                        no_suffix=no_suffix,
-                        target_video=video,
-                    )
-                    row["saved"] = result.srt_paths or result.zip_path
-            except (NoSubtitleFoundError, TitleNotFoundError) as exc:
-                row["status"] = "not found"
-                row["error"] = str(exc)
-                saw_missing = True
-            except (SubZoneError, ValueError, OSError) as exc:
-                row["status"] = "error"
-                row["error"] = str(exc)
-                saw_error = True
-            rows.append(row)
-            progress.advance(task)
+        if workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_match_one, video): i for i, video in enumerate(videos)}
+                for future in as_completed(futures):
+                    rows[futures[future]] = future.result()
+                    progress.advance(task)
+        else:
+            for i, video in enumerate(videos):
+                progress.update(task, description=f"[cyan]{video.name[:40]}")
+                rows[i] = _match_one(video)
+                progress.advance(task)
 
     if json_out:
         _emit(rows, True)
@@ -541,7 +603,7 @@ def auto(
         summary.add_column("status")
         summary.add_column("saved", overflow="fold")
         for row in rows:
-            style = {"ok": "green", "dry-run": "cyan", "not found": "yellow"}.get(
+            style = {"ok": "green", "dry-run": "cyan", "not found": "yellow", "skipped": "yellow"}.get(
                 row["status"], "red"
             )
             saved = ", ".join(row.get("saved") or []) or row.get("error", "") or "-"
@@ -554,6 +616,8 @@ def auto(
             )
         console.print(summary)
 
+    saw_error = any(row["status"] == "error" for row in rows)
+    saw_missing = any(row["status"] in ("not found", "skipped") for row in rows)
     if saw_error:
         raise typer.Exit(EXIT_ERROR)
     if saw_missing:
@@ -609,6 +673,80 @@ def popular(
 
 
 # ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+config_app = typer.Typer(
+    help="Read and write the config file whose values every command uses as defaults.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("path")
+def config_path_cmd() -> None:
+    """Print the config file location."""
+    console.print(config_path())
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the config file location and every value stored in it."""
+    path = config_path()
+    try:
+        cfg = load_config(strict=True)
+    except ValueError as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+    if not cfg:
+        console.print(
+            f"[dim]config file:[/dim] {path}\n"
+            "[dim](empty - every option keeps its built-in default)\n"
+            "[dim]set values with:[/dim] subz config set <key> <value>"
+        )
+        return
+    table = Table(title=f"Config: {path}", box=box.SIMPLE_HEAVY)
+    table.add_column("key", style="bold cyan")
+    table.add_column("value", overflow="fold")
+    table.add_column("type", style="dim")
+    table.add_column("description", overflow="fold", style="dim")
+    for key in sorted(cfg):
+        spec = CONFIG_SPEC.get(key)
+        table.add_row(key, str(cfg[key]), type(cfg[key]).__name__, spec[2] if spec else "-")
+    console.print(table)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Dotted key, e.g. defaults.language."),
+    value: str = typer.Argument(..., help="Value to store (true/false, numbers, text)."),
+) -> None:
+    """Store one key in the config file."""
+    try:
+        typed = set_config_value(key, value)
+    except KeyError as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+    except ValueError as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+    console.print(f"[green]Saved[/green] [bold]{key}[/bold] = {typed!r} -> {config_path()}")
+
+
+@config_app.command("unset")
+def config_unset(
+    key: str = typer.Argument(..., help="Dotted key to remove."),
+) -> None:
+    """Remove one key so it falls back to the built-in default."""
+    try:
+        removed = unset_config_value(key)
+    except KeyError as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+    if removed:
+        console.print(f"[green]Removed[/green] {key} -> {config_path()}")
+    else:
+        console.print(f"[yellow]{key} was not set in {config_path()}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # tui
 # ---------------------------------------------------------------------------
 
@@ -628,14 +766,22 @@ def tui(ctx: typer.Context) -> None:
 @app.callback()
 def _callback(
     ctx: typer.Context,
-    base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Site base URL."),
-    user_agent: str = typer.Option(DEFAULT_USER_AGENT, "--user-agent", help="User-Agent header."),
-    timeout: float = typer.Option(20.0, "--timeout", help="HTTP timeout in seconds."),
-    retries: int = typer.Option(3, "--retries", help="Retries per request."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="Site base URL (default: config network.base-url)."),
+    user_agent: Optional[str] = typer.Option(None, "--user-agent", help="User-Agent header (default: config network.user-agent)."),
+    timeout: Optional[float] = typer.Option(None, "--timeout", help="HTTP timeout in seconds (default: config network.timeout)."),
+    retries: Optional[int] = typer.Option(None, "--retries", help="Retries per request (default: config network.retries)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Log HTTP requests."),
 ) -> None:
     """[bold]subz[/bold] - search and download subtitles from subzone.ir."""
-    ctx.obj = Settings(base_url, user_agent, timeout, retries, verbose)
+    cfg = load_config()
+    ctx.obj = Settings(
+        base_url=base_url or cfg.get("network.base-url") or DEFAULT_BASE_URL,
+        user_agent=user_agent or cfg.get("network.user-agent") or DEFAULT_USER_AGENT,
+        timeout=float(timeout if timeout is not None else cfg.get("network.timeout", 20.0)),
+        retries=int(retries if retries is not None else cfg.get("network.retries", 3)),
+        verbose=verbose or bool(cfg.get("network.verbose", False)),
+        config=cfg,
+    )
 
 
 def main() -> None:

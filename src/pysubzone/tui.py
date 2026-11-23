@@ -1,24 +1,36 @@
 """Textual TUI for PySubZone.
 
-Interactive flow:
+Interactive screens (switch with Ctrl+S / Ctrl+B / Ctrl+A, quit with Ctrl+Q):
 
-    [SearchScreen]  type a query, Enter -> results table
+    [SearchScreen]    type a query, Enter -> results table
          | Enter on a row
          v
-    [VersionsScreen]  all uploads of that title, language filter,
-         | Enter on a row        refresh with 'r'
+    [VersionsScreen]  all uploads of that title, language filter
+         | Enter on a row        (remembered between sessions)
          v
-    [DownloadDialog]  pick destination folder, extract or keep zip,
-         progress bar while downloading, notification when done
+    [DownloadDialog]  destination folder, optional "save as" rename,
+         | extract or keep zip, progress bar, notification
+         v
+    saved - destination folder is remembered for next time
+
+    [AutoScreen]      the `subz auto` flow: scan a folder, match every
+                      video, dry-run or download; Enter on a matched row
+                      opens its VersionsScreen to pick another upload
+
+    [BrowseScreen]    the `subz popular` flow: popular/latest uploads,
+                      media-type + page filters; Enter opens the
+                      download dialog for the selected upload
 
 All network work runs in thread workers, so the UI never blocks.
+The last destination folder and language filter are remembered in the
+config directory (settings.json, next to config.toml).
 Launch with ``subz tui``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -35,9 +47,10 @@ from textual.widgets import (
 )
 
 from .client import SubZoneClient
+from .config import load_tui_settings, save_tui_settings
 from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
-from .models import TitleResult
+from .models import BrowseEntry, TitleResult
 
 
 class SearchScreen(Screen):
@@ -116,7 +129,7 @@ class SearchScreen(Screen):
 
 class VersionsScreen(Screen):
     BINDINGS = [
-        ("escape", "app.pop_screen", "Back to results"),
+        ("escape", "app.pop_screen", "Back"),
         ("r", "refresh", "Refresh"),
     ]
 
@@ -140,19 +153,24 @@ class VersionsScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#versions", DataTable)
         table.add_columns("language", "rate", "author", "releases", "comment", "ref")
-        self._load(None)
+        # remember destination / language settings are stored in settings.json
+        remembered = load_tui_settings().get("lang")
+        if remembered:
+            self.query_one("#lang", Input).value = str(remembered)
+        self._load(resolve(str(remembered)) if remembered else None, str(remembered or ""))
 
     def action_refresh(self) -> None:
         lang_input = self.query_one("#lang", Input)
-        self._load(resolve(lang_input.value.strip()))
+        raw = lang_input.value.strip()
+        self._load(resolve(raw) if raw else None, raw)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "lang":
-            value = event.value.strip()
-            self._load(resolve(value) if value else None)
+            raw = event.value.strip()
+            self._load(resolve(raw) if raw else None, raw)
 
     @work(thread=True, exclusive=True)
-    def _load(self, lang_slug: Optional[str]) -> None:
+    def _load(self, lang_slug: Optional[str], raw_value: str = "") -> None:
         status = self.query_one("#status", Static)
         label = display_name(lang_slug) if lang_slug else "all languages"
         self.app.call_from_thread(status.update, f"Loading versions ({label}) ...")
@@ -166,9 +184,9 @@ class VersionsScreen(Screen):
             return
 
         table = self.query_one("#versions", DataTable)
-        self.app.call_from_thread(self._fill_table, table, versions, label)
+        self.app.call_from_thread(self._fill_table, table, versions, label, raw_value)
 
-    def _fill_table(self, table: DataTable, versions, label: str) -> None:
+    def _fill_table(self, table: DataTable, versions, label: str, raw_value: str = "") -> None:
         self.versions = versions
         table.clear()
         for v in versions:
@@ -185,6 +203,8 @@ class VersionsScreen(Screen):
             f"{len(versions)} versions ({label}) - Enter downloads, r refreshes, Esc goes back"
         )
         table.focus()
+        if raw_value:
+            save_tui_settings({"lang": raw_value})
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "versions" and self.versions:
@@ -210,6 +230,10 @@ class DownloadDialog(ModalScreen):
             ),
             Static(", ".join(self.version.releases[:2]) or "-", id="dl-releases"),
             Input(placeholder="Destination folder (default: ./subs)", id="dest"),
+            Input(
+                placeholder="Save as - optional name for the subtitle file, empty = automatic",
+                id="saveas",
+            ),
             Horizontal(
                 Button("Extract subtitles", id="extract", variant="primary"),
                 Button("Keep zip", id="zip", variant="default"),
@@ -220,16 +244,27 @@ class DownloadDialog(ModalScreen):
             id="dl-box",
         )
 
+    def on_mount(self) -> None:
+        remembered = load_tui_settings().get("dest")
+        if remembered:
+            self.query_one("#dest", Input).value = str(remembered)
+
+    def _set_buttons(self, enabled: bool) -> None:
+        for button_id in ("#extract", "#zip"):
+            self.query_one(button_id, Button).disabled = not enabled
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id not in ("extract", "zip"):
+            return
         dest = Path(self.query_one("#dest", Input).value.strip() or "subs")
+        saveas = self.query_one("#saveas", Input).value.strip() or None
         mode = "zip" if event.button.id == "zip" else "extract"
         # prevent double submits
-        for button_id in ("#extract", "#zip"):
-            self.query_one(button_id, Button).disabled = True
-        self._download(dest, mode)
+        self._set_buttons(False)
+        self._download(dest, mode, saveas)
 
     @work(thread=True, exclusive=True)
-    def _download(self, dest: Path, mode: str) -> None:
+    def _download(self, dest: Path, mode: str, base_name: Optional[str]) -> None:
         status = self.query_one("#dl-status", Static)
         progress = self.query_one("#dl-progress", ProgressBar)
         self.app.call_from_thread(status.update, "Downloading ...")
@@ -242,25 +277,338 @@ class DownloadDialog(ModalScreen):
                     progress=done,
                 )
 
+        def _set_buttons(enabled: bool) -> None:
+            for button_id in ("#extract", "#zip"):
+                self.query_one(button_id, Button).disabled = not enabled
+
         try:
             result = self.client.download(
                 self.version,
                 dest_dir=dest,
                 save_mode=mode,
+                base_name=base_name,
                 on_progress=on_progress,
             )
         except SubZoneError as exc:
             self.app.call_from_thread(status.update, f"[red]{exc}[/red]")
+            self.app.call_from_thread(_set_buttons, True)
             return
 
         saved = result.zip_path or ", ".join(result.srt_paths)
-        self.app.call_from_thread(
-            status.update,
-            f"[green]Saved:[/green] {saved}   [dim](Esc closes)[/dim]",
-        )
+        self.app.call_from_thread(status.update, f"[green]Saved:[/green] {saved}   [dim](Esc closes)[/dim]")
+        self.app.call_from_thread(_set_buttons, True)
+        # remember the destination folder for the next dialog / auto run
+        save_tui_settings({"dest": str(dest)})
         self.app.call_from_thread(
             self.app.notify, f"Subtitle saved: {saved}", title="Download complete"
         )
+
+
+class AutoScreen(Screen):
+    """The `subz auto` flow: scan a folder and match every video."""
+
+    BINDINGS = [
+        ("escape", "app.show_search", "Search"),
+        ("r", "rescan", "Re-scan"),
+    ]
+
+    def __init__(self, client: SubZoneClient, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.client = client
+        self.matches: List[Dict[str, Any]] = []
+        self.title_results: List[Optional[TitleResult]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static("Auto-match a folder - the [bold]subz auto[/bold] flow", id="banner")
+        yield Input(placeholder="Folder with video files (or one video path) - Enter starts a dry run", id="auto-folder")
+        yield Input(placeholder="Language (fa, en, tr, ...)", id="auto-lang")
+        yield Input(
+            placeholder="Output folder - optional; relative = inside the videos folder",
+            id="auto-out",
+        )
+        yield Horizontal(
+            Button("Dry run", id="auto-dry", variant="default"),
+            Button("Match & extract", id="auto-extract", variant="primary"),
+            Button("Match & zip", id="auto-zip", variant="default"),
+            id="auto-buttons",
+        )
+        yield DataTable(id="auto-table", cursor_type="row")
+        yield ProgressBar(total=100, show_eta=False, id="auto-progress")
+        yield Static("", id="auto-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#auto-table", DataTable)
+        table.add_columns("video", "title", "score", "status")
+        remembered = load_tui_settings()
+        if remembered.get("lang"):
+            self.query_one("#auto-lang", Input).value = str(remembered["lang"])
+        if remembered.get("auto_out"):
+            self.query_one("#auto-out", Input).value = str(remembered["auto_out"])
+
+    def _set_buttons(self, enabled: bool) -> None:
+        for button_id in ("#auto-dry", "#auto-extract", "#auto-zip"):
+            self.query_one(button_id, Button).disabled = not enabled
+
+    def action_rescan(self) -> None:
+        """Start a dry run for the folder currently in the input."""
+        self._start_run(dry=True, mode="extract")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "auto-folder":
+            self._start_run(dry=True, mode="extract")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "auto-dry":
+            self._start_run(dry=True, mode="extract")
+        elif event.button.id == "auto-extract":
+            self._start_run(dry=False, mode="extract")
+        elif event.button.id == "auto-zip":
+            self._start_run(dry=False, mode="zip")
+
+    def _start_run(self, dry: bool, mode: str) -> None:
+        folder = self.query_one("#auto-folder", Input).value.strip()
+        status = self.query_one("#auto-status", Static)
+        if not folder:
+            status.update("[red]Enter a folder with video files first[/red]")
+            return
+        lang_value = self.query_one("#auto-lang", Input).value.strip()
+        out_value = self.query_one("#auto-out", Input).value.strip()
+        progress = self.query_one("#auto-progress", ProgressBar)
+        table = self.query_one("#auto-table", DataTable)
+        self._set_buttons(False)
+        self._run(folder, lang_value, out_value, dry, mode, status, progress, table)
+
+    @work(thread=True, exclusive=True)
+    def _run(
+        self,
+        folder: str,
+        lang_value: str,
+        out_value: str,
+        dry: bool,
+        mode: str,
+        status: Static,
+        progress: ProgressBar,
+        table: DataTable,
+    ) -> None:
+        from .matcher import find_videos
+
+        def ui(fn, *args, **kwargs) -> None:
+            self.app.call_from_thread(fn, *args, **kwargs)
+
+        ui(status.update, f"Scanning [bold]{folder}[/bold] ...")
+        lang_slug = resolve(lang_value) or DEFAULT_LANGUAGE
+        out_path = Path(out_value).expanduser() if out_value else None
+        try:
+            videos = find_videos(Path(folder).expanduser())
+        except (ValueError, FileNotFoundError) as exc:
+            ui(status.update, f"[red]{exc}[/red]")
+            ui(self._set_buttons, True)
+            return
+        if not videos:
+            ui(status.update, f"[yellow]No video files found under {folder}[/yellow]")
+            ui(self._set_buttons, True)
+            return
+
+        ui(table.clear)
+        ui(progress.update, total=len(videos), progress=0)
+        self.matches = []
+        self.title_results = []
+        total = len(videos)
+        for position, video in enumerate(videos, start=1):
+            ui(status.update, f"[{position}/{total}] matching [bold]{video.name[:44]}[/bold] ...")
+            row: Dict[str, Any] = {
+                "video": video.name,
+                "title": None,
+                "score": None,
+                "status": "",
+                "detail": "",
+            }
+            title_result: Optional[TitleResult] = None
+            try:
+                title, best, score = self.client.best_for_file(video.stem, lang=lang_slug)
+                row.update({"title": title.name, "score": score})
+                title_result = title
+                if dry:
+                    row["status"] = "dry run"
+                else:
+                    dest = _resolve_out(out_path, video.parent, False) or video.parent
+                    result = self.client.download(
+                        best,
+                        dest_dir=dest,
+                        save_mode=mode,
+                        target_video=video,
+                    )
+                    row["status"] = "saved"
+                    row["detail"] = result.zip_path or ", ".join(result.srt_paths)
+            except (NoSubtitleFoundError, TitleNotFoundError) as exc:
+                row["status"] = "not found"
+                row["detail"] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - one bad video must not stop the batch
+                row["status"] = "error"
+                row["detail"] = str(exc)
+            self.matches.append(row)
+            self.title_results.append(title_result)
+            ui(progress.advance, 1)
+
+        def fill() -> None:
+            table.clear()
+            for r in self.matches:
+                score = "-" if r["score"] is None else str(r["score"])
+                table.add_row(r["video"][:40], r["title"] or "-", score, r["status"])
+            table.focus()
+
+        ui(fill)
+        if dry:
+            summary = f"{total} video(s) matched (dry run)"
+        else:
+            saved = sum(1 for r in self.matches if r["status"] == "saved")
+            summary = f"{saved}/{total} subtitle(s) saved"
+        ui(
+            status.update,
+            f"[green]{summary}[/green] - Enter opens a matched title, r re-scans, Esc goes back",
+        )
+        if lang_value:
+            save_tui_settings({"lang": lang_value})
+        if out_value:
+            save_tui_settings({"auto_out": out_value})
+        ui(self._set_buttons, True)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "auto-table":
+            return
+        index = event.cursor_row
+        if 0 <= index < len(self.title_results) and self.title_results[index]:
+            self.app.push_screen(VersionsScreen(self.client, self.title_results[index]))
+
+
+class BrowseScreen(Screen):
+    """The `subz popular` flow: browse popular/latest uploads."""
+
+    BINDINGS = [
+        ("escape", "app.show_search", "Search"),
+        ("p", "mode_popular", "Popular"),
+        ("l", "mode_latest", "Latest"),
+        ("left", "page_up", "Prev page"),
+        ("right", "page_down", "Next page"),
+    ]
+
+    def __init__(self, client: SubZoneClient, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.client = client
+        self.entries: List[BrowseEntry] = []
+        self.mode = "popular"
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static("Browse uploads - popular or latest, like [bold]subz popular[/bold]", id="banner")
+        with Horizontal(id="browse-controls"):
+            yield Button("Popular", id="btn-popular", variant="primary")
+            yield Button("Latest", id="btn-latest", variant="default")
+            yield Input(placeholder="type: all / film / series / music", id="browse-kind")
+            yield Input(placeholder="page", id="browse-page")
+        yield DataTable(id="browse-table", cursor_type="row")
+        yield Static("", id="browse-status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#browse-table", DataTable)
+        table.add_columns("title", "language", "type", "owner", "date", "ref")
+        self.query_one("#browse-page", Input).value = "1"
+        self._load()
+
+    def action_mode_popular(self) -> None:
+        self.mode = "popular"
+        self._load()
+
+    def action_mode_latest(self) -> None:
+        self.mode = "latest"
+        self._load()
+
+    def action_page_up(self) -> None:
+        page_input = self.query_one("#browse-page", Input)
+        try:
+            page_input.value = str(max(1, int(page_input.value.strip() or "1") - 1))
+        except ValueError:
+            page_input.value = "1"
+        self._load()
+
+    def action_page_down(self) -> None:
+        page_input = self.query_one("#browse-page", Input)
+        try:
+            page_input.value = str(max(1, int(page_input.value.strip() or "1")) + 1)
+        except ValueError:
+            page_input.value = "1"
+        self._load()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-popular":
+            self.action_mode_popular()
+        elif event.button.id == "btn-latest":
+            self.action_mode_latest()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in ("browse-kind", "browse-page"):
+            self._load()
+
+    def _load(self) -> None:
+        kind = self.query_one("#browse-kind", Input).value.strip() or "all"
+        page_text = self.query_one("#browse-page", Input).value.strip() or "1"
+        status = self.query_one("#browse-status", Static)
+        try:
+            page = int(page_text)
+        except ValueError:
+            status.update("[red]Page must be a number[/red]")
+            return
+        if page < 1:
+            page = 1
+            self.query_one("#browse-page", Input).value = "1"
+        self._fetch(self.mode, kind, page, status, self.query_one("#browse-table", DataTable))
+
+    @work(thread=True, exclusive=True)
+    def _fetch(self, mode: str, kind: str, page: int, status: Static, table: DataTable) -> None:
+        def ui(fn, *args) -> None:
+            self.app.call_from_thread(fn, *args)
+
+        ui(status.update, f"Loading {mode} {kind} uploads (page {page}) ...")
+        try:
+            entries = self.client.browse(mode=mode, kind=kind, page=page)
+        except ValueError as exc:
+            ui(status.update, f"[red]{exc}[/red]")
+            return
+        except SubZoneError as exc:
+            ui(status.update, f"[red]{exc}[/red]")
+            return
+
+        self.entries = entries
+
+        def fill() -> None:
+            table.clear()
+            for entry in entries:
+                table.add_row(
+                    entry.title_name[:48],
+                    entry.version.language,
+                    entry.media_type,
+                    entry.owner,
+                    entry.date,
+                    entry.version.ref,
+                )
+            table.focus()
+
+        ui(fill)
+        ui(
+            status.update,
+            f"{len(entries)} {mode} uploads ({kind}, page {page}) - Enter downloads, "
+            "p/l switch popular/latest, left/right change page, Esc goes back",
+        )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "browse-table":
+            return
+        index = event.cursor_row
+        if 0 <= index < len(self.entries):
+            self.app.push_screen(DownloadDialog(self.client, self.entries[index].version))
 
 
 class SubZoneTUI(App):
@@ -273,16 +621,33 @@ class SubZoneTUI(App):
         color: $text;
         text-style: bold;
     }
-    #query, #lang {
+    #query, #lang, #auto-folder, #auto-lang, #auto-out {
         margin: 1 1;
     }
-    #results, #versions {
+    #results, #versions, #auto-table, #browse-table {
         height: 1fr;
         margin: 0 1;
     }
-    #status {
+    #status, #auto-status, #browse-status {
         padding: 0 1;
         color: $accent;
+    }
+    #auto-buttons {
+        height: auto;
+        margin: 0 1 1 1;
+    }
+    #auto-buttons Button {
+        margin-right: 1;
+    }
+    #browse-controls {
+        height: auto;
+        margin: 1 1;
+    }
+    #browse-controls Button {
+        margin-right: 1;
+    }
+    #browse-controls Input {
+        width: 1fr;
     }
     #dl-box {
         width: 72;
@@ -297,7 +662,7 @@ class SubZoneTUI(App):
         color: $text-muted;
         margin-bottom: 1;
     }
-    #dest {
+    #dest, #saveas {
         margin-bottom: 1;
     }
     #dl-buttons {
@@ -314,13 +679,39 @@ class SubZoneTUI(App):
 
     BINDINGS = [
         ("ctrl+q", "quit", "Quit"),
+        ("ctrl+s", "show_search", "Search"),
+        ("ctrl+b", "show_browse", "Browse"),
+        ("ctrl+a", "show_auto", "Auto-match"),
     ]
 
     def __init__(self, client: SubZoneClient) -> None:
         super().__init__()
         self.client = client
 
+    def get_default_screen(self) -> Screen:
+        return SearchScreen(self.client)
+
     def on_mount(self) -> None:
         self.title = "PySubZone"
         self.sub_title = "subzone.ir subtitle downloader"
-        self.push_screen(SearchScreen(self.client))
+
+    async def _swap(self, screen: Screen) -> None:
+        """Replace the current top-level screen.
+
+        switch_screen pops the current top screen, which fails while the
+        stack still holds only the default screen - so the very first
+        navigation pushes instead.
+        """
+        if len(self.screen_stack) > 1:
+            await self.switch_screen(screen)
+        else:
+            await self.push_screen(screen)
+
+    async def action_show_search(self) -> None:
+        await self._swap(SearchScreen(self.client))
+
+    async def action_show_browse(self) -> None:
+        await self._swap(BrowseScreen(self.client))
+
+    async def action_show_auto(self) -> None:
+        await self._swap(AutoScreen(self.client))

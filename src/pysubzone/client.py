@@ -20,8 +20,9 @@ import io
 import logging
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -31,6 +32,7 @@ from .exceptions import (
     DownloadError,
     NetworkError,
     NoSubtitleFoundError,
+    SubZoneError,
     TitleNotFoundError,
 )
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
@@ -80,6 +82,12 @@ def _slugify_lang_suffix(lang_slug: str) -> str:
         "urdu": "ur",
     }
     return short.get(lang_slug, re.sub(r"[^a-z0-9]+", "-", lang_slug).strip("-"))
+
+
+def _sanitize_base_name(base_name: str) -> str:
+    """Keep only the final path part of a requested output base name."""
+    cleaned = Path(str(base_name).strip()).name
+    return cleaned or "subtitle"
 
 
 class SubZoneClient:
@@ -284,6 +292,7 @@ class SubZoneClient:
         lang_suffix: Optional[str] = None,    # None -> auto ("fa" ...)
         no_suffix: bool = False,
         target_video: Optional[Union[str, Path]] = None,
+        base_name: Optional[str] = None,      # rename output (overrides other naming)
         on_progress: Optional[ProgressCallback] = None,
     ) -> DownloadResult:
         """Download one subtitle.
@@ -291,7 +300,9 @@ class SubZoneClient:
         *target* may be a :class:`SubtitleVersion`, a :class:`SubtitleDetails`
         or a reference ``"<slug>/<lang>/<id>"``.  ``save_mode='extract'``
         unpacks the subtitle files (named after *target_video* when given),
-        ``save_mode='zip'`` keeps the original archive.
+        ``save_mode='zip'`` keeps the original archive.  *base_name* renames
+        the output regardless: files become ``<base_name>.<suffix>.srt``
+        (or ``<base_name>.zip``); path parts are stripped for safety.
         """
         if isinstance(target, SubtitleDetails):
             version = target.version
@@ -313,7 +324,9 @@ class SubZoneClient:
         dest = Path(dest_dir)
         dest.mkdir(parents=True, exist_ok=True)
 
-        if target_video is not None:
+        if base_name:
+            zip_name = f"{_sanitize_base_name(base_name)}.zip"
+        elif target_video is not None:
             zip_name = f"{Path(target_video).with_suffix('').name}.zip"
         else:
             zip_name = f"{version.slug}-{version.lang}-{version.sub_id}.zip"
@@ -364,7 +377,9 @@ class SubZoneClient:
         suffix = ""
         if not no_suffix:
             suffix = lang_suffix or _slugify_lang_suffix(version.lang)
-        srts = self._extract_subtitles(payload, dest, version, suffix, target_video)
+        srts = self._extract_subtitles(
+            payload, dest, version, suffix, target_video, base_name=base_name
+        )
         return DownloadResult(
             zip_path=None,
             srt_paths=[str(p) for p in srts],
@@ -410,6 +425,65 @@ class SubZoneClient:
     def grab_url(self, url: str, **download_kwargs) -> List[DownloadResult]:
         """Alias of :meth:`download_url` (URL grab command)."""
         return self.download_url(url, **download_kwargs)
+
+    def download_many(
+        self,
+        targets: Sequence[SubtitleRef],
+        dest_dir: Union[str, Path] = ".",
+        save_mode: str = "extract",
+        lang_suffix: Optional[str] = None,
+        no_suffix: bool = False,
+        base_name: Optional[str] = None,
+        max_workers: int = 1,
+        on_progress: Optional[ProgressCallback] = None,
+        on_result: Optional["Callable[[int, Union[DownloadResult, Exception]], None]"] = None,
+    ) -> List[Union[DownloadResult, Exception]]:
+        """Download several subtitles as one batch.
+
+        *targets* is an iterable of refs / versions / details, exactly like
+        :meth:`download` accepts.  Returns a list aligned with *targets*
+        holding a :class:`DownloadResult` per success and an
+        :class:`Exception` instance per failure - one bad ref never aborts
+        the rest of the batch.
+
+        ``max_workers=1`` (default) downloads sequentially; values above 1
+        download concurrently in a thread pool (capped to the number of
+        targets).  *on_progress* is forwarded to every item; *on_result*
+        is called with ``(index, result_or_exception)`` from worker threads
+        as items complete, so callers can update UIs/progress incrementally.
+        """
+        target_list = list(targets)
+        if max_workers < 1:
+            raise ValueError("max_workers must be >= 1")
+        workers = min(max_workers, len(target_list)) or 1
+        download_kwargs = dict(
+            dest_dir=dest_dir,
+            save_mode=save_mode,
+            lang_suffix=lang_suffix,
+            no_suffix=no_suffix,
+            base_name=base_name,
+            on_progress=on_progress,
+        )
+        results: List[Union[DownloadResult, Exception]] = [None] * len(target_list)  # type: ignore[list-item]
+
+        def _one(index: int, target: SubtitleRef) -> None:
+            try:
+                results[index] = self.download(target, **download_kwargs)
+            except Exception as exc:  # noqa: BLE001 - batch keeps per-item errors
+                results[index] = exc
+            if on_result is not None:
+                try:
+                    on_result(index, results[index])
+                except Exception:  # noqa: BLE001 - user callbacks must not break the batch
+                    pass
+
+        if workers == 1:
+            for index, target in enumerate(target_list):
+                _one(index, target)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_one, range(len(target_list)), target_list))
+        return results
 
     def browse(
         self,
@@ -466,6 +540,7 @@ class SubZoneClient:
         version: SubtitleVersion,
         suffix: str,
         target_video: Optional[Union[str, Path]],
+        base_name: Optional[str] = None,
     ) -> List[Path]:
         try:
             archive = zipfile.ZipFile(io.BytesIO(payload))
@@ -483,7 +558,9 @@ class SubZoneClient:
                 f"{', '.join(archive.namelist()[:6]) or 'empty archive'}"
             )
 
-        if target_video is not None:
+        if base_name:
+            base = _sanitize_base_name(base_name)
+        elif target_video is not None:
             # Only the file NAME comes from the video; the folder is always
             # dest_dir (this is what makes ``subz auto -o DIR`` work).
             base = Path(target_video).with_suffix("").name

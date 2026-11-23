@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysubzone"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python API, CLI and TUI to search and download subtitles from subzone.ir (Subf2m subtitle database)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -47,6 +47,7 @@ dependencies = [
     "typer>=0.9",
     "rich>=13.0",
     "textual>=0.60",
+    "tomli>=1.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
