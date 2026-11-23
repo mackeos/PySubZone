@@ -100,6 +100,22 @@ def _fail(message: str, code: int) -> int:
     return code
 
 
+def _resolve_out(out: Optional[Path], source: Optional[Path], out_cwd: bool = False) -> Optional[Path]:
+    """Resolve -o/--out for the auto/filename commands.
+
+    A relative path is created inside *source* (the videos folder), so that
+    ``-o subs`` collects subtitles in a ``subs`` folder next to the videos.
+    Absolute paths are used unchanged, and ``out_cwd=True`` restores the old
+    behavior of resolving against the current directory.  ``None`` means no
+    output folder was requested (caller falls back to its own default).
+    """
+    if out is None:
+        return None
+    if out.is_absolute() or out_cwd or source is None:
+        return out
+    return (source / out).resolve()
+
+
 def _is_slug_like(value: str) -> bool:
     return bool(value) and all(c.isalnum() or c in "-_" for c in value) and " " not in value
 
@@ -343,7 +359,8 @@ def filename(
     ctx: typer.Context,
     file: str = typer.Argument(..., help="Video file path or release name."),
     lang: Optional[str] = typer.Option(DEFAULT_LANGUAGE, "--lang", "-l", help="Subtitle language."),
-    out: Path = typer.Option(Path("."), "--out", "-o", help="Output directory when FILE is not a real file."),
+    out: Path = typer.Option(Path("."), "--out", "-o", help="Output folder (relative: inside the video's folder; absolute: as-is; default: beside the video)."),
+    out_cwd: bool = typer.Option(False, "--out-cwd", help="Resolve a relative --out against the current directory instead of the video's folder."),
     save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zip instead of extracting it."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
     no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
@@ -358,9 +375,10 @@ def filename(
     query = guess_title(stem)
     lang_slug = resolve(lang) or DEFAULT_LANGUAGE
     real_file = Path(file).is_file()
-    # A real video file saves beside itself unless the user picked a directory
-    # with -o/--out; a bare release name saves to --out (default: cwd).
-    dest_dir = Path(file).parent if real_file and out == Path(".") else out
+    # Relative -o paths are created inside the video's folder; absolute paths
+    # are used as-is; --out-cwd restores current-directory-relative behavior.
+    source = Path(file).parent if real_file else None
+    dest_dir = _resolve_out(out, source, out_cwd) or (source or Path("."))
     if not json_out:
         console.print(
             f"[dim]query:[/dim] [bold]{query}[/bold]   "
@@ -438,7 +456,8 @@ def auto(
     ctx: typer.Context,
     path: Path = typer.Argument(..., help="Video file or a folder containing videos."),
     lang: Optional[str] = typer.Option(DEFAULT_LANGUAGE, "--lang", "-l", help="Subtitle language."),
-    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Save subtitles here instead of next to each video."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output folder for subtitles (relative: inside the videos folder; absolute: as-is)."),
+    out_cwd: bool = typer.Option(False, "--out-cwd", help="Resolve a relative --out against the current directory instead of the videos folder."),
     save_zip: bool = typer.Option(False, "--zip", help="Keep the downloaded zips instead of extracting them."),
     lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
     no_suffix: bool = typer.Option(False, "--no-suffix", help="Name files 'Movie.srt' instead of 'Movie.fa.srt'."),
@@ -491,7 +510,7 @@ def auto(
                 if dry_run:
                     row["status"] = "dry-run"
                 else:
-                    dest = out if out else video.parent
+                    dest = _resolve_out(out, video.parent, out_cwd) or video.parent
                     result = client.download(
                         best,
                         dest_dir=dest,

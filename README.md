@@ -82,7 +82,7 @@ subz versions TITLE [-l LANG] [--json]        List subtitle uploads
 subz download REF [-o DIR] [--zip] [--json]   Download by reference, URL, or slug
 subz url URL [-l LANG] [-n N] [--zip]         Download from a SubZone URL
 subz filename FILE [-l LANG] [--no-download]  Find the best subtitle for one video
-subz auto PATH [-l LANG] [--dry-run] [--zip]   Match videos in a folder
+subz auto PATH [-l LANG] [-o DIR] [--out-cwd]    Match videos in a folder
 subz popular [--mode popular|latest]           Browse popular or latest uploads
             [-t all|film|series|music] [-p PAGE]
 subz tui                                       Open the interactive interface
@@ -175,11 +175,16 @@ subz auto /media/shows -l fa --dry-run
 # Download and extract subtitles beside the videos
 subz auto /media/shows -l fa
 
-# Save all subtitles into a separate folder
-subz auto /media/shows -l fa -o ./subs
+# Save subtitles into a "subs" folder inside the videos folder
+subz auto /media/shows -l fa -o subs
+
+# Old behavior: resolve a relative output folder against the current directory
+subz auto /media/shows -l fa -o subs --out-cwd
 ```
 
 For each video, the release name is parsed for details such as the title, season and episode, resolution, source, and release group. Subtitle versions with conflicting episode numbers are rejected, exact release matches are preferred, and season packs can be used as fallbacks.
+
+The output folder is controlled by `-o/--out`. A **relative** path is created **inside the videos folder** (each video's own folder), so `-o subs` collects subtitles in a `subs` folder next to the videos. An **absolute** path is used exactly as given. Without `-o`, subtitles are saved beside each video. To resolve relative paths against the current directory instead (the behavior up to v0.1.1), pass `--out-cwd`.
 
 A failed match does not stop the whole collection: unsuccessful files are included in the final summary.
 

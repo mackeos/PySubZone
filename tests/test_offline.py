@@ -266,3 +266,41 @@ def test_extract_multiple_members_get_indexes(tmp_path):
     )
     names = sorted(p.name for p in written)
     assert names == ["Arcane.S02E01.fa.1.srt", "Arcane.S02E01.fa.2.srt"]
+
+
+# ---------------------------------------------------------------------------
+# -o/--out resolution (auto / filename)
+# (relative -o must land INSIDE the videos folder; --out-cwd = old behavior)
+# ---------------------------------------------------------------------------
+
+def test_resolve_out_relative_goes_inside_source(tmp_path):
+    from pysubzone.cli import _resolve_out
+
+    source = tmp_path / "shows" / "Arcane.S02"
+    dest = _resolve_out(Path("subs"), source, out_cwd=False)
+    assert dest == (source / "subs").resolve()
+
+
+def test_resolve_out_absolute_path_untouched(tmp_path):
+    from pysubzone.cli import _resolve_out
+
+    absolute = tmp_path / "absolute" / "subs"
+    assert _resolve_out(absolute, tmp_path, out_cwd=False) == absolute
+
+
+def test_resolve_out_none_means_no_request():
+    from pysubzone.cli import _resolve_out
+
+    assert _resolve_out(None, Path("/anywhere"), out_cwd=False) is None
+
+
+def test_resolve_out_cwd_flag_restores_old_behavior(tmp_path):
+    from pysubzone.cli import _resolve_out
+
+    assert _resolve_out(Path("subs"), tmp_path, out_cwd=True) == Path("subs")
+
+
+def test_resolve_out_without_source_stays_cwd_relative():
+    from pysubzone.cli import _resolve_out
+
+    assert _resolve_out(Path("subs"), None, out_cwd=False) == Path("subs")
