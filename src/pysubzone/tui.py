@@ -18,9 +18,11 @@ quit with Ctrl+Q):
                       video, dry-run or download; an optional
                       "Prefer complete season pack" checkbox (remembered
                       between sessions, default from
-                      defaults.prefer-complete) serves every episode
-                      video from one same-season pack - like the CLI's
-                      --prefer-complete - while each video still gets its
+                      defaults.prefer-complete) finds same-season packs
+                      covering every episode video - like the CLI's
+                      --prefer-complete - and a picker screen lists them
+                      ranked, so you choose which one serves the folder
+                      (Esc = per-video best); each video still gets its
                       own episode extracted and renamed; Enter on a
                       matched row opens its VersionsScreen, Enter on a
                       failed row shows why it failed
@@ -63,6 +65,7 @@ from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import find_videos, resolve_out
 from .models import BrowseEntry, TitleResult
+from .scoring import score_version
 
 
 class SearchScreen(Screen):
@@ -316,6 +319,63 @@ class DownloadDialog(ModalScreen):
         )
 
 
+class PackPickerScreen(ModalScreen):
+    """Pick one complete-season pack for a group of episode videos.
+
+    Opened by the auto-match screen when the prefer-complete checkbox is on
+    and covering packs were found (the TUI counterpart of the CLI pack
+    prompt).  Enter (or selecting a row) uses the chosen pack for the whole
+    group - each video still receives its own episode extracted and
+    renamed; Esc falls back to the per-video best match.
+    """
+
+    BINDINGS = [("escape", "use_per_video_best", "Per-video best")]
+
+    def __init__(self, title, group, ranked, dry: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.title_result = title
+        self.group = group
+        self.ranked = ranked
+        self.dry = dry
+
+    def compose(self) -> ComposeResult:
+        next_step = "dry run" if self.dry else "download"
+        yield Vertical(
+            Static(
+                f"[bold]{len(self.ranked)}[/bold] complete-season pack(s) cover "
+                f"[bold]{len(self.group)}[/bold] episode video(s) of "
+                f"[bold]{self.title_result.name}[/bold] - best match first",
+                id="picker-title",
+            ),
+            DataTable(id="picker-table", cursor_type="row"),
+            Static(
+                "Enter: use the selected pack - Esc: keep per-video best "
+                f"- then {next_step}",
+                id="picker-hint",
+            ),
+            id="picker-box",
+        )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#picker-table", DataTable)
+        table.add_columns("#", "fit", "release", "author")
+        for i, (total, version) in enumerate(self.ranked, 1):
+            avg = round(total / len(self.group)) if self.group else total
+            release = version.releases[0] if version.releases else version.ref
+            table.add_row(str(i), str(avg), release, version.author or "-")
+        table.focus()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "picker-table":
+            return
+        index = event.cursor_row
+        if 0 <= index < len(self.ranked):
+            self.dismiss(self.ranked[index][1])
+
+    def action_use_per_video_best(self) -> None:
+        self.dismiss(None)
+
+
 class AutoScreen(Screen):
     """The `subz auto` flow: scan a folder and match every video."""
 
@@ -396,63 +456,111 @@ class AutoScreen(Screen):
         if not folder:
             status.update("[red]Enter a folder with video files first[/red]")
             return
-        lang_value = self.query_one("#auto-lang", Input).value.strip()
-        out_value = self.query_one("#auto-out", Input).value.strip()
-        prefer = self.query_one("#auto-prefer-complete", Checkbox).value
-        progress = self.query_one("#auto-progress", ProgressBar)
-        table = self.query_one("#auto-table", DataTable)
+        self._run_ctx: Dict[str, Any] = {
+            "folder": folder,
+            "lang_value": self.query_one("#auto-lang", Input).value.strip(),
+            "out_value": self.query_one("#auto-out", Input).value.strip(),
+            "prefer": self.query_one("#auto-prefer-complete", Checkbox).value,
+            "dry": dry,
+            "mode": mode,
+            "status": status,
+            "progress": self.query_one("#auto-progress", ProgressBar),
+            "table": self.query_one("#auto-table", DataTable),
+            "planner_note": "",
+        }
+        self._planned: Dict[Path, tuple] = {}
+        self._pending_groups: List[tuple] = []
         self._set_buttons(False)
-        self._run(folder, lang_value, out_value, dry, mode, prefer, status, progress, table)
+        self._plan()
 
     @work(thread=True, exclusive=True)
-    def _run(
-        self,
-        folder: str,
-        lang_value: str,
-        out_value: str,
-        dry: bool,
-        mode: str,
-        prefer_complete: bool,
-        status: Static,
-        progress: ProgressBar,
-        table: DataTable,
-    ) -> None:
+    def _plan(self) -> None:
+        """Worker: scan the folder and find covering packs (best-effort)."""
+        ctx = self._run_ctx
+
         def ui(fn, *args, **kwargs) -> None:
             self.app.call_from_thread(fn, *args, **kwargs)
 
-        ui(status.update, f"Scanning [bold]{folder}[/bold] ...")
-        lang_slug = resolve(lang_value) or DEFAULT_LANGUAGE
-        out_path = Path(out_value).expanduser() if out_value else None
+        ui(ctx["status"].update, f"Scanning [bold]{ctx['folder']}[/bold] ...")
+        lang_slug = resolve(ctx["lang_value"]) or DEFAULT_LANGUAGE
         try:
-            videos = find_videos(Path(folder).expanduser())
+            videos = find_videos(Path(ctx["folder"]).expanduser())
         except (ValueError, FileNotFoundError) as exc:
-            ui(status.update, f"[red]{exc}[/red]")
+            ui(ctx["status"].update, f"[red]{exc}[/red]")
             ui(self._set_buttons, True)
             return
         if not videos:
-            ui(status.update, f"[yellow]No video files found under {folder}[/yellow]")
+            ui(ctx["status"].update, f"[yellow]No video files found under {ctx['folder']}[/yellow]")
             ui(self._set_buttons, True)
             return
+        ui(ctx["table"].clear)
+        ui(ctx["progress"].update, total=len(videos), progress=0)
+        ctx["videos"] = videos
+        ctx["lang_slug"] = lang_slug
 
-        ui(table.clear)
-        ui(progress.update, total=len(videos), progress=0)
+        if ctx["prefer"]:
+            ui(ctx["status"].update, "Looking for complete-season packs ...")
+            try:
+                groups = self.client.find_complete_packs(videos, lang=lang_slug)
+            except Exception as exc:  # noqa: BLE001 - planning is best-effort
+                ctx["planner_note"] = f"prefer-complete planning skipped: {exc}"
+                groups = []
+            else:
+                if groups and not any(ranked for _t, _g, ranked in groups):
+                    ctx["planner_note"] = (
+                        "no covering complete-season pack found - per-video best stays"
+                    )
+        else:
+            groups = []
+        ui(self._begin_pack_pick, groups)
+
+    def _begin_pack_pick(self, groups: List[tuple]) -> None:
+        """UI thread: chain the pack pickers, then run the per-video batch."""
+        self._pending_groups = [g for g in groups if g[2]]
+        self._open_next_picker()
+
+    def _open_next_picker(self) -> None:
+        """UI thread: prompt for the next group, or start the batch run."""
+        if not self._pending_groups:
+            self._run_matches()
+            return
+        title, group, ranked = self._pending_groups.pop(0)
+
+        def picked(pack_version) -> None:
+            if pack_version is not None:
+                for video in group:
+                    s = score_version(video.name, pack_version)
+                    if s is not None:
+                        self._planned[video] = (title, pack_version, s)
+            self._open_next_picker()
+
+        self.app.push_screen(
+            PackPickerScreen(title, group, ranked, dry=self._run_ctx["dry"]),
+            picked,
+        )
+
+    @work(thread=True, exclusive=True)
+    def _run_matches(self) -> None:
+        """Worker: match every video (pack-planned ones included) and save."""
+        ctx = self._run_ctx
+        planner_note = ctx["planner_note"]
+        prefer = ctx["prefer"]
+
+        def ui(fn, *args, **kwargs) -> None:
+            self.app.call_from_thread(fn, *args, **kwargs)
+
+        planned: Dict[Path, tuple] = self._planned if prefer else {}
+        dry = ctx["dry"]
+        mode = ctx["mode"]
+        out_path = Path(ctx["out_value"]).expanduser() if ctx["out_value"] else None
+        lang_slug = ctx["lang_slug"]
+        videos = ctx["videos"]
+        status = ctx["status"]
+        progress = ctx["progress"]
+        table = ctx["table"]
         self.matches = []
         self.title_results = []
         total = len(videos)
-
-        # prefer-complete (the checkbox): try to serve the whole folder
-        # from one same-season pack, exactly like `subz auto
-        # --prefer-complete`.  Best-effort - a planning failure never
-        # breaks the normal per-video flow.
-        planned: Dict[Path, tuple] = {}
-        planner_note = ""
-        if prefer_complete:
-            ui(status.update, "Looking for a complete-season pack ...")
-            try:
-                planned = self.client.plan_prefer_complete(videos, lang=lang_slug)
-            except Exception as exc:  # noqa: BLE001 - planning is best-effort
-                planner_note = f"prefer-complete planning skipped: {exc}"
-
         for position, video in enumerate(videos, start=1):
             ui(status.update, f"[{position}/{total}] matching [bold]{video.name[:44]}[/bold] ...")
             row: Dict[str, Any] = {
@@ -524,11 +632,11 @@ class AutoScreen(Screen):
             status.update,
             f"[green]{summary}[/green] - Enter opens a matched title, r re-scans, Esc goes back",
         )
-        if lang_value:
-            save_tui_settings({"lang": lang_value})
-        if out_value:
-            save_tui_settings({"auto_out": out_value})
-        save_tui_settings({"prefer_complete": prefer_complete})
+        if ctx["lang_value"]:
+            save_tui_settings({"lang": ctx["lang_value"]})
+        if ctx["out_value"]:
+            save_tui_settings({"auto_out": ctx["out_value"]})
+        save_tui_settings({"prefer_complete": prefer})
         ui(self._set_buttons, True)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -707,6 +815,24 @@ class SubZoneTUI(App):
     }
     #auto-buttons Checkbox {
         margin-left: 2;
+    }
+    #picker-box {
+        width: 90;
+        max-width: 100%;
+        padding: 1 2;
+        background: $surface;
+        border: tall $primary;
+    }
+    #picker-title {
+        margin-bottom: 1;
+    }
+    #picker-table {
+        height: auto;
+        max-height: 14;
+        margin-bottom: 1;
+    }
+    #picker-hint {
+        color: $text-muted;
     }
     #browse-controls {
         height: auto;

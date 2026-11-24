@@ -1750,6 +1750,11 @@ def _auto_pack_stub_client():
 
             return SubZoneClient.plan_prefer_complete(self, videos, lang=lang)
 
+        def find_complete_packs(self, videos, lang=None):
+            from pysubzone.client import SubZoneClient
+
+            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
+
         def best_for_file(self, stem, lang=None):
             return (
                 TitleResult(name="Show", slug="show-season-2", url=""),
@@ -1923,34 +1928,28 @@ def test_client_plan_prefer_complete_returns_empty_without_cover(tmp_path):
 
 def test_tui_auto_screen_prefer_complete_checkbox_flow(tmp_path, config_env):
     """The auto screen must offer the CLI's --prefer-complete: a checkbox
-    drives the shared planner, planned rows carry a '(pack)' marker, and the
-    choice is remembered for the next session."""
+    opens the ranked pack picker, the chosen pack plans the whole group,
+    rows carry a '(pack)' marker, and the choice is remembered."""
     from pysubzone.config import load_tui_settings
-    from pysubzone.models import TitleResult
-    from pysubzone.tui import AutoScreen, SubZoneTUI
-    from textual.widgets import Button, Checkbox, Input
+    from pysubzone.tui import AutoScreen, PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Checkbox, DataTable, Input
 
     for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
         (tmp_path / name).touch()
 
-    pack = SubtitleVersion(
+    complete = SubtitleVersion(
         slug="show", lang="farsi_persian", sub_id="9",
         releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
     )
 
     class _PackClient(_WorkingClient):
-        def plan_prefer_complete(self, videos, lang=None):
-            from pysubzone.scoring import season_info
+        def title_versions(self, slug, lang=None):
+            return [complete]
 
-            planned = {}
-            for v in videos:
-                info = season_info(v.name)
-                if info.season == 2 and info.episodes is not None:
-                    planned[v] = (
-                        TitleResult(name="Show", slug="show", year=2024, subtitle_count=5),
-                        pack, 77,
-                    )
-            return planned
+        def find_complete_packs(self, videos, lang=None):
+            from pysubzone.client import SubZoneClient
+
+            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
 
     client = _PackClient()
 
@@ -1968,7 +1967,19 @@ def test_tui_auto_screen_prefer_complete_checkbox_flow(tmp_path, config_env):
             checkbox.value = True
             await pilot.pause()
             screen.query_one("#auto-dry", Button).press()
-            await app.workers.wait_for_complete()
+            await app.workers.wait_for_complete()  # planning worker
+            await pilot.pause()
+
+            # the ranked pack picker opens before anything runs
+            assert isinstance(app.screen, PackPickerScreen)
+            picker = app.screen
+            picker_table = picker.query_one("#picker-table", DataTable)
+            assert picker_table.row_count == 1
+
+            # Enter = use the selected pack for the whole group
+            await pilot.press("enter")
+            await pilot.pause()
+            await app.workers.wait_for_complete()  # batch worker
             await pilot.pause()
 
             assert screen.matches, "dry run produced no rows"
@@ -1978,14 +1989,151 @@ def test_tui_auto_screen_prefer_complete_checkbox_flow(tmp_path, config_env):
             # the choice survives into settings.json for the next session
             assert load_tui_settings().get("prefer_complete") is True
 
-            # unticked: the normal per-video best match, no pack marker
+            # unticked: the normal per-video best match, no picker, no marker
             checkbox.value = False
             await pilot.pause()
             screen.query_one("#auto-dry", Button).press()
             await app.workers.wait_for_complete()
             await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)  # no picker this time
             assert not any(m.get("pack") for m in screen.matches), screen.matches
             assert load_tui_settings().get("prefer_complete") is False
+
+    _run_async(scenario())
+
+
+def test_tui_pack_picker_escape_falls_back_to_per_video_best(tmp_path, config_env):
+    """Esc in the pack picker must reject the pack for that group: every
+    video then keeps its normal per-video best match (sub_id 7)."""
+    from pysubzone.models import DownloadResult
+    from pysubzone.tui import AutoScreen, PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Checkbox, Input
+
+    for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
+        (tmp_path / name).touch()
+
+    complete = SubtitleVersion(
+        slug="show", lang="farsi_persian", sub_id="9",
+        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
+    )
+
+    class _PackClient(_WorkingClient):
+        def __init__(self):
+            super().__init__()
+            self.downloads: List[dict] = []
+
+        def title_versions(self, slug, lang=None):
+            return [complete]
+
+        def find_complete_packs(self, videos, lang=None):
+            from pysubzone.client import SubZoneClient
+
+            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
+
+        def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
+            self.downloads.append({"version": version, "video": target_video})
+            return DownloadResult(
+                zip_path=None, srt_paths=["/tmp/x.srt"], version=version,
+            )
+
+    client = _PackClient()
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            screen = app.screen
+            screen.query_one("#auto-folder", Input).value = str(tmp_path)
+            screen.query_one("#auto-prefer-complete", Checkbox).value = True
+            await pilot.pause()
+            screen.query_one("#auto-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, PackPickerScreen)
+
+            # Esc = per-video best for this group
+            await pilot.press("escape")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert screen.matches, screen.matches
+            assert not any(m.get("pack") for m in screen.matches)
+            assert all(m["status"] == "saved" for m in screen.matches)
+            assert {d["version"].sub_id for d in client.downloads} == {"7"}
+
+    _run_async(scenario())
+
+
+def test_tui_pack_picker_second_choice_is_used(tmp_path, config_env):
+    """Selecting a non-first row in the picker must plan that exact pack."""
+    from pysubzone.models import DownloadResult
+    from pysubzone.scoring import covering_versions
+    from pysubzone.tui import PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Checkbox, Input
+
+    for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
+        (tmp_path / name).touch()
+
+    complete = SubtitleVersion(
+        slug="show", lang="farsi_persian", sub_id="9",
+        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
+    )
+    span = SubtitleVersion(
+        slug="show", lang="farsi_persian", sub_id="8",
+        releases=["Show.S02E01-E05.1080p.WEBRip"], author="tester",
+    )
+
+    class _PackClient(_WorkingClient):
+        def __init__(self):
+            super().__init__()
+            self.downloads: List[dict] = []
+
+        def title_versions(self, slug, lang=None):
+            return [complete, span]
+
+        def find_complete_packs(self, videos, lang=None):
+            from pysubzone.client import SubZoneClient
+
+            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
+
+        def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
+            self.downloads.append({"version": version, "video": target_video})
+            return DownloadResult(
+                zip_path=None, srt_paths=["/tmp/x.srt"], version=version,
+            )
+
+    client = _PackClient()
+    stems = ["Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"]
+    ranked = covering_versions(stems, [complete, span])
+    assert len(ranked) == 2, "both packs must cover the two episodes"
+    second_id = ranked[1][1].sub_id
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            screen = app.screen
+            screen.query_one("#auto-folder", Input).value = str(tmp_path)
+            screen.query_one("#auto-prefer-complete", Checkbox).value = True
+            await pilot.pause()
+            screen.query_one("#auto-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, PackPickerScreen)
+
+            # move to the second row and take it
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert screen.matches
+            assert {d["version"].sub_id for d in client.downloads} == {second_id}
+            assert all(m.get("pack") for m in screen.matches)
 
     _run_async(scenario())
 
@@ -2021,3 +2169,254 @@ def test_tui_auto_screen_checkbox_defaults_from_config(tmp_path, config_env):
             assert checkbox.value is False
 
     _run_async(second())
+
+
+def test_scoring_covering_versions_ranks_all_candidates():
+    """covering_versions: every pack covering the whole group, best first,
+    consistent with best_covering_version."""
+    from pysubzone.scoring import best_covering_version, covering_versions
+
+    def _ver(sub_id, lines):
+        return SubtitleVersion(
+            slug="show-season-2", lang="english", sub_id=str(sub_id),
+            releases=lines, author="t",
+        )
+
+    season_pack = _ver("100", ["Arcane.Season2.COMPLETE.1080p.WEB-DL.DDP5.1.Atmos.x264"])
+    span_pack = _ver("101", ["Arcane.S02E01-E09.1080p.WEB-DL"])
+    act_pack = _ver("102", ["Arcane.S02E01-E03.1080p.WEBRip"])
+    s1_pack = _ver("103", ["Arcane.SEASON.01.S01.COMPLETE.1080p.WEBRip"])
+    stems = [f"Show.S02E0{i}.1080p.WEB-DL" for i in (1, 2, 3)]
+
+    ranked = covering_versions(stems, [act_pack, s1_pack, span_pack, season_pack])
+    ids = [v.sub_id for _total, v in ranked]
+    # E01-E03 act pack covers these three stems too (E05 would not);
+    # the S1 pack never qualifies (wrong season)
+    assert set(ids) == {"100", "101", "102"}, ids
+    # descending by total score
+    totals = [total for total, _v in ranked]
+    assert totals == sorted(totals, reverse=True)
+    # the top entry IS best_covering_version's answer
+    best = best_covering_version(stems, [act_pack, s1_pack, span_pack, season_pack])
+    assert best is not None and best[1].sub_id == ranked[0][1].sub_id
+    # empty inputs and no-cover cases
+    assert covering_versions([], [season_pack]) == []
+    assert covering_versions(["Some.Movie.2023.1080p.BluRay"], [season_pack]) == []
+
+
+def test_client_find_complete_packs_groups_and_ranks(tmp_path):
+    """find_complete_packs: one group per matched title, ranked covering
+    packs, movies and season-folder videos excluded."""
+    from pysubzone.client import SubZoneClient
+
+    stub, _downloads = _auto_pack_stub_client()
+    client = SubZoneClient()
+    client.best_for_file = stub.best_for_file
+    client.title_versions = stub.title_versions
+
+    names = (
+        "Show.S02E01.1080p.WEBRip.mkv",
+        "Show.S02E05.1080p.WEBRip.mkv",
+        "Show.S02.1080p.WEBRip.mkv",  # season folder: no episode
+        "Some.Movie.2023.1080p.BluRay.mkv",
+    )
+    videos = [tmp_path / n for n in names]
+    groups = client.find_complete_packs(videos, lang="english")
+
+    assert len(groups) == 1
+    title, group, ranked = groups[0]
+    assert title.slug == "show-season-2"
+    assert {p.name for p in group} == {
+        "Show.S02E01.1080p.WEBRip.mkv",
+        "Show.S02E05.1080p.WEBRip.mkv",
+    }
+    # both versions cover the two episodes (act pack spans 1-3? no - E05 is
+    # outside, so only the COMPLETE pack qualifies)
+    assert [v.sub_id for _t, v in ranked] == ["9"]
+
+
+def _auto_multi_pack_stub_client():
+    """The two-pack stub plus a spanning act pack, for pick tests."""
+    stub, downloads = _auto_pack_stub_client()
+    span = SubtitleVersion(
+        slug="show-season-2", lang="english", sub_id="8",
+        releases=["Show.S02E01-E05.1080p.WEBRip"], author="t",
+    )
+    base_versions = stub.title_versions("show-season-2", "english")
+    stub.title_versions = lambda slug, lang=None: [*base_versions, span]
+    return stub, downloads
+
+
+def test_cli_auto_prefer_complete_lists_packs_and_uses_best(tmp_path, config_env, monkeypatch):
+    """Non-interactive runs still show the ranked pack list and use the best
+    pack automatically."""
+    import json as _json
+
+    from pysubzone.cli import app
+    from pysubzone.scoring import covering_versions
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E02.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Some.Movie.2023.1080p.BluRay.mkv").touch()
+    stub, downloads = _auto_multi_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(
+        app, ["auto", str(tmp_path), "-y", "--prefer-complete", "--map-json", "-"],
+    )
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    rows = {Path(r["video"]).name: r for r in data["results"]}
+
+    stems = [
+        "Show.S02E01.1080p.WEBRip.mkv",
+        "Show.S02E02.1080p.WEBRip.mkv",
+        "Show.S02E05.1080p.WEBRip.mkv",
+    ]
+    versions = stub.title_versions("show-season-2", "english")
+    ranked = covering_versions(stems, versions)
+    best_ref = ranked[0][1].ref
+    assert len(ranked) == 2  # COMPLETE pack and E01-E05 span pack qualify
+
+    for name in stems:
+        row = rows[name]
+        assert row["mode"] == "complete-pack"
+        assert row["ref"] == best_ref
+    movie = rows["Some.Movie.2023.1080p.BluRay.mkv"]
+    assert "mode" not in movie and movie["ref"].endswith("/7")
+
+
+def test_cli_auto_prefer_complete_interactive_pick(tmp_path, config_env, monkeypatch):
+    """With a TTY and more than one covering pack, the user can pick one;
+    choosing pack 2 must plan exactly that pack."""
+    import json as _json
+
+    from pysubzone.cli import app
+    from pysubzone.scoring import covering_versions
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E02.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Some.Movie.2023.1080p.BluRay.mkv").touch()
+    stub, _downloads = _auto_multi_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+    monkeypatch.setattr("pysubzone.cli._stdin_isatty", lambda: True)
+
+    stems = [
+        "Show.S02E01.1080p.WEBRip.mkv",
+        "Show.S02E02.1080p.WEBRip.mkv",
+        "Show.S02E05.1080p.WEBRip.mkv",
+    ]
+    versions = stub.title_versions("show-season-2", "english")
+    ranked = covering_versions(stems, versions)
+    second_ref = ranked[1][1].ref
+
+    result = _runner().invoke(
+        app,
+        ["auto", str(tmp_path), "--prefer-complete", "--map-json", str(tmp_path / "map.json")],
+        input="2\n",
+    )
+    assert result.exit_code == 0, result.output
+    data = _json.loads((tmp_path / "map.json").read_text(encoding="utf-8"))
+    rows = {Path(r["video"]).name: r for r in data["results"]}
+    for name in stems:
+        row = rows[name]
+        assert row["mode"] == "complete-pack"
+        assert row["ref"] == second_ref
+    # the movie is never part of any pack group
+    assert "mode" not in rows["Some.Movie.2023.1080p.BluRay.mkv"]
+    # the ranking was printed for the user
+    assert "covering pack(s):" in result.output
+
+
+def test_cli_auto_prefer_complete_interactive_skip(tmp_path, config_env, monkeypatch):
+    """Answering 0 keeps the per-video best for the whole group."""
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    stub, _downloads = _auto_multi_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+    monkeypatch.setattr("pysubzone.cli._stdin_isatty", lambda: True)
+
+    result = _runner().invoke(
+        app,
+        ["auto", str(tmp_path), "--prefer-complete", "--map-json", str(tmp_path / "map.json")],
+        input="0\n",
+    )
+    assert result.exit_code == 0, result.output
+    data = _json.loads((tmp_path / "map.json").read_text(encoding="utf-8"))
+    for row in data["results"]:
+        assert "mode" not in row
+        assert row["ref"].endswith("/7")
+    assert "per-video best for these videos" in result.output
+
+
+def test_cli_auto_prefer_complete_interactive_invalid_then_valid(tmp_path, config_env, monkeypatch):
+    """Out-of-range answers re-prompt instead of crashing or mis-planning."""
+    import json as _json
+
+    from pysubzone.cli import app
+    from pysubzone.scoring import covering_versions
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    stub, _downloads = _auto_multi_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+    monkeypatch.setattr("pysubzone.cli._stdin_isatty", lambda: True)
+
+    stems = ["Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"]
+    ranked = covering_versions(stems, stub.title_versions("show-season-2", "english"))
+    second_ref = ranked[1][1].ref
+
+    result = _runner().invoke(
+        app,
+        ["auto", str(tmp_path), "--prefer-complete", "--map-json", str(tmp_path / "map.json")],
+        input="9\n2\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "Enter a number between 0 and 2" in result.output
+    data = _json.loads((tmp_path / "map.json").read_text(encoding="utf-8"))
+    for row in data["results"]:
+        if row["video"].endswith(".mkv") and "S02E0" in row["video"]:
+            assert row["ref"] == second_ref
+
+
+def test_cli_auto_prefer_complete_dry_run_never_prompts(tmp_path, config_env, monkeypatch):
+    """Dry runs list the packs but never prompt, even on a TTY."""
+    from pysubzone.cli import app
+    from pysubzone.scoring import covering_versions
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    stub, downloads = _auto_multi_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+    monkeypatch.setattr("pysubzone.cli._stdin_isatty", lambda: True)
+
+    result = _runner().invoke(
+        app, ["auto", str(tmp_path), "--prefer-complete", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "covering pack(s):" in result.output
+    assert "-> pack 1" in result.output
+    assert downloads == []  # dry run downloads nothing
+
+    # -y also skips the prompt (scripting stays non-interactive)
+    ranked = covering_versions(
+        ["Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"],
+        stub.title_versions("show-season-2", "english"),
+    )
+    best_ref = ranked[0][1].ref
+    result = _runner().invoke(
+        app, ["auto", str(tmp_path), "-y", "--prefer-complete", "--map-json", "-"],
+        input="",
+    )
+    assert result.exit_code == 0, result.output
+    import json as _json
+    data = _json.loads(result.output)
+    for row in data["results"]:
+        if "S02E0" in row["video"]:
+            assert row["ref"] == best_ref

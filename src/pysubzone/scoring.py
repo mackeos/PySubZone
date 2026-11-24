@@ -391,6 +391,37 @@ def covers_episodes(video_release: str, version: SubtitleVersion) -> bool:
     return False
 
 
+def covering_versions(
+    video_releases: List[str],
+    versions: List[SubtitleVersion],
+    weights: Optional[ScoreWeights] = None,
+) -> List[Tuple[int, SubtitleVersion]]:
+    """Every version whose release lines cover *every* video, best first.
+
+    Ranked sibling of :func:`best_covering_version` behind ``subz auto
+    --prefer-complete`` and the TUI pack picker: candidates must cover all
+    videos (see :func:`covers_episodes`); they are sorted by total match
+    score, highest first.  Same-season packs and act packs spanning the
+    whole group both qualify.  Empty list when nothing covers them all.
+    """
+    ranked: List[Tuple[int, SubtitleVersion]] = []
+    if not video_releases:
+        return ranked
+    for version in versions:
+        total = 0
+        for stem in video_releases:
+            if not covers_episodes(stem, version):
+                break
+            s = score_version(stem, version, weights)
+            if s is None:
+                break
+            total += s
+        else:
+            ranked.append((total, version))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
 def best_covering_version(
     video_releases: List[str],
     versions: List[SubtitleVersion],
@@ -405,19 +436,5 @@ def best_covering_version(
     highest total score wins.  Returns ``None`` for an empty video list or
     when nothing covers them all.
     """
-    if not video_releases:
-        return None
-    best: Optional[Tuple[int, SubtitleVersion]] = None
-    for version in versions:
-        total = 0
-        for stem in video_releases:
-            if not covers_episodes(stem, version):
-                break
-            s = score_version(stem, version, weights)
-            if s is None:
-                break
-            total += s
-        else:
-            if best is None or total > best[0]:
-                best = (total, version)
-    return best
+    ranked = covering_versions(video_releases, versions, weights)
+    return ranked[0] if ranked else None

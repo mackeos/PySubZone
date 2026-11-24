@@ -42,7 +42,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import guess_title, guess_season_episode
 from .models import DownloadResult, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
 from .parsing import parse_search, parse_subtitles_url, parse_subtitle_page, parse_title
-from .scoring import ScoreWeights, best_covering_version, pick_best, score_version, season_info
+from .scoring import ScoreWeights, best_covering_version, covering_versions, pick_best, score_version, season_info
 
 DEFAULT_BASE_URL = "https://subzone.ir"
 DEFAULT_USER_AGENT = (
@@ -374,6 +374,37 @@ class SubZoneClient:
         callers wrap this in try/except so planning stays best-effort and
         a failure never breaks the normal flow.
         """
+        planned: Dict[Path, Tuple[TitleResult, SubtitleVersion, int]] = {}
+        for title, group, ranked in self.find_complete_packs(videos, lang=lang):
+            if not ranked:
+                continue
+            _total, pack = ranked[0]
+            for video in group:
+                s = score_version(video.name, pack)
+                if s is not None:
+                    planned[video] = (title, pack, s)
+        return planned
+
+    def find_complete_packs(
+        self,
+        videos: List[Path],
+        lang: Optional[str] = None,
+    ) -> List[Tuple[TitleResult, List[Path], List[Tuple[int, SubtitleVersion]]]]:
+        """Group episode videos per title with their ranked covering packs.
+
+        The interactive engine behind ``subz auto --prefer-complete`` and
+        the TUI pack picker: every group of same-title episode videos is
+        returned together with **all** versions whose release lines cover
+        every video of the group, ranked best-first by total score (see
+        :func:`~.scoring.covering_versions`).  A group with no covering
+        pack comes back with an empty ranking so callers can fall back to
+        the per-video best.
+
+        Movies and videos without a pinned season/episode never appear in
+        the groups.  Raises whatever ``best_for_file``/``title_versions``
+        raise - callers wrap this in try/except so planning stays
+        best-effort and a failure never breaks the normal flow.
+        """
         episode_videos = [
             v for v in videos
             if season_info(v.name).episodes is not None
@@ -385,18 +416,12 @@ class SubZoneClient:
             title, _best, _score = self.best_for_file(video.stem, lang=lang)
             grouped.setdefault(title.slug, []).append(video)
             titles_by_slug[title.slug] = title
-        planned: Dict[Path, Tuple[TitleResult, SubtitleVersion, int]] = {}
+        groups: List[Tuple[TitleResult, List[Path], List[Tuple[int, SubtitleVersion]]]] = []
         for slug, group in grouped.items():
             versions = self.title_versions(slug, lang)
-            covering = best_covering_version([v.name for v in group], versions)
-            if covering is None:
-                continue
-            _total, pack = covering
-            for video in group:
-                s = score_version(video.name, pack)
-                if s is not None:
-                    planned[video] = (titles_by_slug[slug], pack, s)
-        return planned
+            ranked = covering_versions([v.name for v in group], versions)
+            groups.append((titles_by_slug[slug], group, ranked))
+        return groups
 
     # ------------------------------------------------------------------
     # downloading

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 import typer
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -49,7 +50,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import resolve_out
 from .models import DownloadResult, TitleResult
 from .parsing import parse_subtitles_url
-from .scoring import rank_versions
+from .scoring import rank_versions, score_version
 
 app = typer.Typer(
     name="subz",
@@ -101,6 +102,30 @@ class Settings:
 def _cfg(settings: Settings, key: str, fallback: Any) -> Any:
     """Config-file value for *key*, falling back when it is not set."""
     return settings.config.get(key, fallback)
+
+
+def _stdin_isatty() -> bool:
+    """Whether the CLI runs interactively (pack picker may prompt)."""
+    return sys.stdin.isatty()
+
+
+def _prompt_pack_choice(count: int) -> int:
+    """Ask which covering pack to use for an episode group.
+
+    ``1..count`` picks a pack from the printed ranking, ``0`` falls back to
+    the per-video best for that group.  Enter accepts the default (pack 1,
+    the highest-scoring candidate).
+    """
+    while True:
+        raw = typer.prompt(
+            f"Use which pack for these videos? [1-{count}, 0 = per-video best]",
+            default="1",
+            type=str,
+        )
+        text = str(raw).strip()
+        if text.isdigit() and 0 <= int(text) <= count:
+            return int(text)
+        console.print(f"[red]Enter a number between 0 and {count}[/red]")
 
 
 def _client(settings: Settings) -> SubZoneClient:
@@ -596,17 +621,61 @@ def auto(
     client = _client(ctx.obj)
 
     # --prefer-complete: try to serve the whole folder from one same-season
-    # pack (e.g. a COMPLETE season zip).  Only episode videos with an
-    # explicitly pinned season AND episode participate; everything else
-    # (movies, season folders, unmatched titles) keeps its own per-video
-    # best.  A planning failure must never break the normal flow.
-    # (Shared with the TUI auto-match checkbox via plan_prefer_complete.)
+    # pack (e.g. a COMPLETE season zip).  Every covering pack of a group is
+    # listed; interactively the user can pick one (0 = per-video best).
+    # Only episode videos with an explicitly pinned season AND episode
+    # participate; everything else (movies, season folders) keeps its own
+    # per-video best.  A planning failure must never break the normal flow.
+    # (Shared with the TUI pack picker via find_complete_packs.)
     planned: Dict[Path, tuple] = {}
     if prefer_complete:
+        interactive = (
+            not dry_run
+            and not yes
+            and _stdin_isatty()
+            and not json_out
+            and map_json != "-"
+        )
+        show = not json_out and map_json != "-"
         try:
-            planned = client.plan_prefer_complete(videos, lang=lang_slug)
+            for title, group, ranked in client.find_complete_packs(videos, lang=lang_slug):
+                if show:
+                    console.print(
+                        f'[bold]"{escape(title.name)}"[/bold] - '
+                        f"{len(group)} episode video(s), {len(ranked)} covering pack(s):"
+                    )
+                    for i, (total, version) in enumerate(ranked, 1):
+                        avg = round(total / len(group))
+                        release = version.releases[0] if version.releases else version.ref
+                        console.print(
+                            f"  [cyan]{i}.[/cyan] [bold]\\[{avg}][/bold] {escape(release)} "
+                            f"[dim](by {escape(version.author or '?')})[/dim]"
+                        )
+                if not ranked:
+                    if show:
+                        console.print(
+                            "  [dim]no pack covers every episode - per-video best stays[/dim]"
+                        )
+                    continue
+                if interactive and len(ranked) > 1:
+                    choice = _prompt_pack_choice(len(ranked))
+                else:
+                    choice = 1
+                if choice == 0:
+                    if show:
+                        console.print("  [dim]-> per-video best for these videos[/dim]")
+                    continue
+                _total, pack = ranked[choice - 1]
+                for video in group:
+                    s = score_version(video.name, pack)
+                    if s is not None:
+                        planned[video] = (title, pack, s)
+                if show:
+                    console.print(
+                        f"  [green]-> pack {choice}[/green] used for {len(group)} episode video(s)"
+                    )
         except Exception as exc:  # noqa: BLE001 - planning is best-effort
-            if not json_out and map_json != "-":
+            if show:
                 console.print(f"[dim]prefer-complete planning skipped: {exc}[/dim]")
 
     def _match_one(video: Path) -> Dict[str, Any]:
