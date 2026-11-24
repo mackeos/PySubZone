@@ -34,7 +34,7 @@ from .models import (
 )
 from .scoring import DEFAULT_WEIGHTS, ScoreWeights
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 __all__ = [
     "SubZoneClient",

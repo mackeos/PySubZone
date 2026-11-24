@@ -681,7 +681,8 @@ def auto(
     def _match_one(video: Path) -> Dict[str, Any]:
         row: Dict[str, Any] = {"video": str(video), "title": None, "status": "ok"}
         try:
-            if video in planned:
+            is_pack = video in planned
+            if is_pack:
                 title, best, score = planned[video]
                 row["mode"] = "complete-pack"
             else:
@@ -701,6 +702,7 @@ def auto(
                     lang_suffix=lang_suffix,
                     no_suffix=no_suffix,
                     target_video=video,
+                    pack=is_pack,
                 )
                 row["saved"] = result.srt_paths or result.zip_path
         except (NoSubtitleFoundError, TitleNotFoundError) as exc:

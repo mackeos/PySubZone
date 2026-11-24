@@ -135,6 +135,7 @@ class AsyncSubZoneClient:
         target_video: Optional[Union[str, Path]] = None,
         base_name: Optional[str] = None,
         on_progress: Optional[ProgressCallback] = None,
+        pack: bool = False,
     ) -> DownloadResult:
         return await asyncio.to_thread(
             self._client.download,
@@ -146,6 +147,7 @@ class AsyncSubZoneClient:
             target_video,
             base_name,
             on_progress,
+            pack=pack,
         )
 
     async def download_url(

@@ -27,7 +27,7 @@ _SOURCES = (
 )
 _GROUP_RE = re.compile(r"-([A-Za-z0-9]+)(?:\.[a-z]{2})?$")
 _SEASON_EPISODE_RE = re.compile(
-    r"\bs(\d{1,2})[\s._-]*e(\d{1,3})\b", re.IGNORECASE
+    r"\bs(\d{1,2})[\s._-]*(?:x[\s._-]*)?e(\d{1,3})\b", re.IGNORECASE
 )
 _EPISODE_ONLY_RE = re.compile(r"\b(?:e|ep)[\s._-]*(\d{1,3})\b", re.IGNORECASE)
 _SEASON_ONLY_RE = re.compile(r"\bs(\d{1,2})\b(?![\s._-]*e)", re.IGNORECASE)
@@ -61,7 +61,7 @@ _SEASON_FA_ORDINALS = {
 # Range tails must carry an explicit E/EP prefix, so release-group tokens
 # like "-4chan" or "-2CH" are never mistaken for episode numbers.
 _EPISODE_RANGE_RE = re.compile(
-    r"\bs(\d{1,2})[\s._-]*ep?(\d{1,3})(?!\d)"
+    r"\bs(\d{1,2})[\s._-]*(?:x[\s._-]*)?ep?(\d{1,3})(?!\d)"
     r"((?:\s*[-–—~]\s*ep?\d{1,3}(?!\d))*)",
     re.IGNORECASE,
 )
@@ -165,6 +165,8 @@ def season_info(name: str) -> SeasonInfo:
     ``episodes`` is an inclusive ``(first, last)`` span: single pins such as
     ``S02E05`` or ``2x05`` give ``(5, 5)``, multi-episode packs give real
     ranges, and lines without explicit episode tokens give ``None``.
+    The ``x``-separated form ``S02xE05`` (as found in subtitle pack archive
+    members) parses like ``S02E05`` too.
     """
     episodes: Optional[Tuple[int, int]] = None
     season_from_range: Optional[int] = None

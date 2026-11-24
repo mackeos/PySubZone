@@ -2420,3 +2420,189 @@ def test_cli_auto_prefer_complete_dry_run_never_prompts(tmp_path, config_env, mo
     for row in data["results"]:
         if "S02E0" in row["video"]:
             assert row["ref"] == best_ref
+
+
+# ---------------------------------------------------------------------------
+# SxxEyy x-form member tags + pack-mode strictness (v0.4.7)
+# (the .ASS.thetic COMPLETE season packs name their zip members
+#  "Arcane [2021] - S02xE01 Heavy is the Crown.ass"; the x form parsed as
+#  untagged, so EVERY video of the folder got all 9 members extracted and
+#  renamed after itself: 9 videos x 9 members = 81 files)
+# ---------------------------------------------------------------------------
+
+_XFORM_PACK_MEMBERS = {
+    "Arcane [2021] - S02xE01 Heavy is the Crown.ass": "E01 lines",
+    "Arcane [2021] - S02xE02 Watch It All Burn.ass": "E02 lines",
+    "Arcane [2021] - S02xE03 Finally Got the Name Right.ass": "E03 lines",
+    "Arcane [2021] - S02xE04 Paint the Town Blue.ass": "E04 lines",
+    "Arcane [2021] - S02xE05 Blisters and Bedrock.ass": "E05 lines",
+    "Arcane [2021] - S02xE06 The Message Hidden Within the Pattern.ass": "E06 lines",
+    "Arcane [2021] - S02xE07 Pretend Like It's the First Time.ass": "E07 lines",
+    "Arcane [2021] - S02xE08 Killing is a Cycle.ass": "E08 lines",
+    "Arcane [2021] - S02xE09 The Dirt Under Your Nails.ass": "E09 lines",
+}
+
+
+def test_season_info_parses_x_form_episode_tags():
+    from pysubzone.scoring import season_info
+
+    info = season_info("Arcane [2021] - S02xE01 Heavy is the Crown.ass")
+    assert (info.season, info.episodes) == (2, (1, 1))
+    info = season_info("Show.S02xE12.720p.WEBRip")
+    assert (info.season, info.episodes) == (2, (12, 12))
+    info = season_info("show s02xe07-e09 1080p")  # x-form act-pack span
+    assert (info.season, info.episodes) == (2, (7, 9))
+    # nothing new parses where nothing parsed before
+    assert season_info("Some.Movie.2023.1080p.BluRay.x265").episodes is None
+    assert season_info("Show.S02.1080p.WEBRip.x265-HODL").episodes is None
+    assert season_info("Show.S02.1080p.WEB-DL.DDP5.1.x265.HEVC").episodes is None
+
+
+def test_extract_xform_pack_one_file_per_video(tmp_path):
+    """The user's exact scenario: a 9-member S02xE0N pack planned onto nine
+    S02E0N videos must write exactly one correctly named file per video."""
+    client = _offline_client()
+    version = SubtitleVersion(
+        slug="arcane-first-season", lang="english", sub_id="3561361"
+    )
+    payload = _zip_payload_with_contents(_XFORM_PACK_MEMBERS)
+    for episode in range(1, 10):
+        video = (
+            f"Arcane.S02E{episode:02d}.Heavy.Is.the.Crown."
+            "1080p.WEBRip.10bit.DDP5.1.x265-HODL.mkv"
+        )
+        written = client._extract_subtitles(
+            payload, tmp_path, version, "en", target_video=video, pack=True,
+        )
+        assert len(written) == 1, (episode, written)
+        assert written[0].name == (
+            f"Arcane.S02E{episode:02d}.Heavy.Is.the.Crown."
+            "1080p.WEBRip.10bit.DDP5.1.x265-HODL.en.ass"
+        )
+        assert written[0].read_text(encoding="utf-8") == f"E{episode:02d} lines"
+    assert len(list(tmp_path.iterdir())) == 9  # nine files total, not 81
+
+
+def test_extract_xform_filter_works_without_pack_flag(tmp_path):
+    """The regex fix alone also repairs plain downloads of an x-form pack."""
+    client = _offline_client()
+    version = SubtitleVersion(slug="arcane-first-season", lang="english", sub_id="1")
+    payload = _zip_payload_with_contents(_XFORM_PACK_MEMBERS)
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Arcane.S02E05.Blisters.and.Bedrock.1080p.mkv",
+    )
+    assert [p.name for p in written] == [
+        "Arcane.S02E05.Blisters.and.Bedrock.1080p.en.ass"
+    ]
+    assert written[0].read_text(encoding="utf-8") == "E05 lines"
+
+
+def test_pack_mode_errors_when_no_member_matches(tmp_path):
+    """pack=True must never dump every member renamed after the video:
+    an archive without a matching member is a clean per-row error, while a
+    regular download keeps the old numbered fall-back."""
+    from pysubzone.exceptions import DownloadError
+
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="farsi_persian", sub_id="42")
+    payload = _zip_payload(["cd1.srt", "cd2.srt"])
+    with pytest.raises(DownloadError, match="none is tagged with episode 1"):
+        client._extract_subtitles(
+            payload, tmp_path, version, "fa",
+            target_video="Arcane.S02E01.mkv", pack=True,
+        )
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "fa",
+        target_video="Arcane.S02E01.mkv", pack=False,
+    )
+    assert sorted(p.name for p in written) == [
+        "Arcane.S02E01.fa.1.srt", "Arcane.S02E01.fa.2.srt",
+    ]
+
+
+def test_pack_mode_errors_when_episode_outside_member_tags(tmp_path):
+    from pysubzone.exceptions import DownloadError
+
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload_with_contents({
+        "Show.S02xE01.en.srt": "E01 lines",
+        "Show.S02xE02.en.srt": "E02 lines",
+        "Show.S02xE03.en.srt": "E03 lines",
+    })
+    with pytest.raises(DownloadError, match="none is tagged with episode 5"):
+        client._extract_subtitles(
+            payload, tmp_path, version, "en",
+            target_video="Show.S02E05.1080p.WEBRip.mkv", pack=True,
+        )
+
+
+def test_pack_mode_keeps_variant_members_numbered(tmp_path):
+    """All members matching the video's episode are legit variants (1080p /
+    720p tracks): pack mode keeps them, numbered like a regular download."""
+    client = _offline_client()
+    version = SubtitleVersion(slug="show", lang="english", sub_id="42")
+    payload = _zip_payload_with_contents({
+        "Show.S02E01.1080p.en.srt": "1080p lines",
+        "Show.S02E01.720p.en.srt": "720p lines",
+    })
+    written = client._extract_subtitles(
+        payload, tmp_path, version, "en",
+        target_video="Show.S02E01.1080p.WEBRip.mkv", pack=True,
+    )
+    assert sorted(p.name for p in written) == [
+        "Show.S02E01.1080p.WEBRip.en.1.srt",
+        "Show.S02E01.1080p.WEBRip.en.2.srt",
+    ]
+
+
+def test_xform_release_lines_score_and_cover():
+    """x-form release lines guard seasons/episodes like the E form."""
+    from pysubzone.scoring import covers_episodes, score_release
+
+    season_pack = SubtitleVersion(
+        slug="show", lang="english", sub_id="200",
+        releases=["Arcane.SEASON.02.S02.COMPLETE.1080p.10bit.WEBRip.6CH.x265.HEVC-PSA"],
+    )
+    assert covers_episodes(
+        "Arcane.S02E01.Heavy.Is.the.Crown.1080p.WEBRip.10bit.DDP5.1.x265-HODL",
+        season_pack,
+    )
+    # x-form act packs are now properly scoped
+    assert score_release(
+        "Show.S02E01.1080p.WEBRip", "Show.S02xE01-E03.1080p.WEBRip"
+    ) == (score_release("Show.S02E01.1080p.WEBRip", "Show.S02E01-E03.1080p.WEBRip")[0], True)
+    assert score_release(
+        "Show.S02E05.1080p.WEBRip", "Show.S02xE01-E03.1080p.WEBRip"
+    )[0] == -100
+    # movies are still never covered
+    assert not covers_episodes("Some.Movie.2023.1080p.BluRay.x265", season_pack)
+
+
+def test_cli_auto_passes_pack_flag_to_download(tmp_path, config_env, monkeypatch):
+    """Pack-planned downloads carry pack=True; per-video downloads don't."""
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Show.S02E05.1080p.WEBRip.mkv").touch()
+    (tmp_path / "Some.Movie.2023.1080p.BluRay.mkv").touch()
+    stub, downloads = _auto_pack_stub_client()
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(
+        app,
+        ["auto", str(tmp_path), "-y", "--prefer-complete", "--map-json", "-"],
+    )
+    assert result.exit_code == 0, result.output
+    _json.loads(result.output)  # output stays valid JSON
+    assert len(downloads) == 3
+    packs = {
+        Path(kwargs["target_video"]).name: kwargs.get("pack")
+        for _target, kwargs in downloads
+    }
+    assert packs["Show.S02E01.1080p.WEBRip.mkv"] is True
+    assert packs["Show.S02E05.1080p.WEBRip.mkv"] is True
+    assert packs["Some.Movie.2023.1080p.BluRay.mkv"] is False

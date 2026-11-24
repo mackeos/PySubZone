@@ -593,6 +593,7 @@ class AutoScreen(Screen):
                         dest_dir=dest,
                         save_mode=mode,
                         target_video=video,
+                        pack=video in planned,
                     )
                     row["status"] = "saved"
                     row["detail"] = str(result.zip_path or ", ".join(result.srt_paths))

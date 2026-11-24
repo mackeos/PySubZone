@@ -437,6 +437,7 @@ class SubZoneClient:
         target_video: Optional[Union[str, Path]] = None,
         base_name: Optional[str] = None,      # rename output (overrides other naming)
         on_progress: Optional[ProgressCallback] = None,
+        pack: bool = False,                   # archive is a pack planned by prefer-complete
     ) -> DownloadResult:
         """Download one subtitle.
 
@@ -446,6 +447,14 @@ class SubZoneClient:
         ``save_mode='zip'`` keeps the original archive.  *base_name* renames
         the output regardless: files become ``<base_name>.<suffix>.srt``
         (or ``<base_name>.zip``); path parts are stripped for safety.
+
+        ``pack=True`` marks a download that prefer-complete planned onto a
+        covering pack: when the video pins an episode and no archive member
+        carries that episode's tag, a :class:`DownloadError` is raised
+        instead of the old fall-back of writing every member renamed after
+        the video (which turned one 9-episode pack into 9 wrong files per
+        video).  Regular downloads keep that fall-back for multi-file
+        archives (CD variants, SDH/forced tracks).
         """
         if isinstance(target, SubtitleDetails):
             version = target.version
@@ -530,7 +539,8 @@ class SubZoneClient:
         if not no_suffix:
             suffix = lang_suffix or _slugify_lang_suffix(version.lang)
         srts = self._extract_subtitles(
-            payload, dest, version, suffix, target_video, base_name=base_name
+            payload, dest, version, suffix, target_video,
+            base_name=base_name, pack=pack,
         )
         return DownloadResult(
             zip_path=None,
@@ -707,7 +717,11 @@ class SubZoneClient:
         return slug, lang, sub_id
 
     @staticmethod
-    def _select_episode_members(members: List[str], target_video: Optional[Union[str, Path]]) -> List[str]:
+    def _select_episode_members(
+        members: List[str],
+        target_video: Optional[Union[str, Path]],
+        pack: bool = False,
+    ) -> List[str]:
         """Keep only the pack members that carry the video's own episode.
 
         Auto-match can hand a multi-episode pack (``S02E01-E03``) to a single
@@ -716,7 +730,16 @@ class SubZoneClient:
         video pins an episode (``SxxEyy``) and member names carry their own
         episode tags, only matching members are written.  Anything ambiguous
         - video without a pinned episode, untagged member names, no match -
-        keeps the previous behaviour (all members, numbered).
+        keeps the previous behaviour (all members, numbered) for regular
+        downloads.
+
+        ``pack=True`` (prefer-complete planned a whole folder onto one
+        archive) is stricter: there the video's episode is explicitly
+        pinned, so writing every member renamed after the video can only
+        produce wrong files (one 9-episode pack once unpacked as 81 files).
+        When no member matches, a :class:`DownloadError` is raised instead
+        so the video shows up as a failed row and another pack (or the
+        per-video best) can take over.
         """
         if target_video is None or len(members) <= 1:
             return members
@@ -739,6 +762,14 @@ class SubZoneClient:
                 and v_info.episodes[0] <= m_info.episodes[1]
             ):
                 matched.append(member)
+        if pack and not matched:
+            first, last = v_info.episodes
+            span = f"episode {first}" if first == last else f"episodes {first}-{last}"
+            raise DownloadError(
+                f"the pack archive holds {len(members)} subtitle file(s) but "
+                f"none is tagged with {span} for {Path(target_video).name!r}; "
+                "pick a different pack or keep the per-video best"
+            )
         return matched if matched and len(matched) < len(members) else members
 
     def _extract_subtitles(
@@ -749,6 +780,7 @@ class SubZoneClient:
         suffix: str,
         target_video: Optional[Union[str, Path]],
         base_name: Optional[str] = None,
+        pack: bool = False,
     ) -> List[Path]:
         try:
             archive = zipfile.ZipFile(io.BytesIO(payload))
@@ -766,7 +798,7 @@ class SubZoneClient:
                 f"{', '.join(archive.namelist()[:6]) or 'empty archive'}"
             )
 
-        members = self._select_episode_members(sorted(members), target_video)
+        members = self._select_episode_members(sorted(members), target_video, pack=pack)
 
         if base_name:
             base = _sanitize_base_name(base_name)
