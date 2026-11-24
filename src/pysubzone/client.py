@@ -40,7 +40,15 @@ from .exceptions import (
 )
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import guess_title, guess_season_episode
-from .models import DownloadResult, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
+from .models import (
+    BulkGroupPlan,
+    BulkPlan,
+    DownloadResult,
+    SubtitleDetails,
+    SubtitleVersion,
+    TitlePage,
+    TitleResult,
+)
 from .parsing import parse_search, parse_subtitles_url, parse_subtitle_page, parse_title
 from .scoring import ScoreWeights, best_covering_version, covering_versions, pick_best, score_version, season_info
 
@@ -424,8 +432,421 @@ class SubZoneClient:
         return groups
 
     # ------------------------------------------------------------------
+    # bulk folder mode (v0.5.0)
+    # ------------------------------------------------------------------
+
+    def plan_bulk(
+        self,
+        videos: Sequence[Union[str, Path]],
+        lang: Optional[str] = None,
+    ) -> BulkPlan:
+        """Plan a bulk folder run: group videos per title with ranked packs.
+
+        Videos are grouped locally by their guessed title (no network), so
+        every distinct group costs exactly ONE search + ONE title page
+        fetch - a nine-episode folder of one show is planned with two
+        requests instead of eighteen.  Each group carries every covering
+        pack ranked best-first (see :func:`~.scoring.covering_versions`)
+        plus each video's own best match, so a group without a covering
+        pack falls back to the per-video match without extra searches.
+
+        Videos whose names do not pin both a season and an episode (movies)
+        never get packs - they form their own per-video groups.  A group
+        whose title search fails comes back with ``title=None`` and
+        ``error`` set; callers report its videos as "not found" instead of
+        raising, so one unmatchable file never aborts the whole folder.
+        """
+        by_query: Dict[str, List[Path]] = {}
+        for raw in videos:
+            video = Path(raw)
+            query = guess_title(video.stem) or video.stem
+            by_query.setdefault(query, []).append(video)
+        groups: List[BulkGroupPlan] = []
+        for query, group in by_query.items():
+            try:
+                title = self.search_exact(query, lang=lang)
+                versions = self.title_versions(title.slug, lang)
+            except SubZoneError as exc:
+                groups.append(BulkGroupPlan(title=None, videos=group, error=str(exc)))
+                continue
+            best_by_video: Dict[Path, Tuple[SubtitleVersion, int]] = {}
+            for video in group:
+                picked = pick_best(video.name, versions)
+                if picked is not None:
+                    best_by_video[video] = (picked[1], picked[0])
+            ranked = covering_versions([v.name for v in group], versions)
+            pinned = all(
+                season_info(video.name).season is not None
+                and season_info(video.name).episodes is not None
+                for video in group
+            )
+            groups.append(
+                BulkGroupPlan(
+                    title=title,
+                    videos=group,
+                    ranked_packs=ranked,
+                    best_by_video=best_by_video,
+                    pinned=pinned,
+                )
+            )
+        return BulkPlan(groups=groups)
+
+    def download_pack_once(
+        self,
+        target: SubtitleRef,
+        videos: Sequence[Union[str, Path]],
+        dest_dir: Union[str, Path, None] = None,   # None -> beside each video
+        save_mode: str = "extract",                # extract | zip
+        lang_suffix: Optional[str] = None,
+        no_suffix: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> List[Tuple[Path, Union[DownloadResult, Exception]]]:
+        """Download ONE pack archive and extract each video's own episode.
+
+        The bulk-mode workhorse behind :meth:`bulk_download`: the zip is
+        fetched exactly once and every video of the group gets its matching
+        member extracted and renamed after the video itself (strict pack
+        semantics - a video whose episode the archive does not carry yields
+        an exception for that video instead of wrong files, so the caller
+        can fall back to the per-video best).  A failure to fetch the
+        archive itself raises.
+
+        Returns ``(video, result_or_exception)`` pairs aligned with
+        *videos*.  ``save_mode='zip'`` writes the archive once (into
+        *dest_dir*, or the first video's folder) and every row references
+        it; ``dest_dir=None`` extracts beside each video.
+        """
+        if isinstance(target, SubtitleDetails):
+            version = target.version
+        elif isinstance(target, SubtitleVersion):
+            version = target
+        else:
+            slug, lang, sub_id = self._parse_ref(target)
+            version = SubtitleVersion(slug=slug, lang=lang, sub_id=sub_id)
+        video_paths = [Path(v) for v in videos]
+        if not video_paths:
+            return []
+        if not version.author and not version.releases:
+            # bare ref: metadata fetch only improves naming; never fatal
+            try:
+                details = self.get_version(version.slug, version.lang, version.sub_id)
+                version = details.version
+            except SubZoneError:
+                pass
+
+        payload = self._fetch_zip_payload(version, on_progress)
+        results: List[Tuple[Path, Union[DownloadResult, Exception]]] = []
+        if save_mode == "zip":
+            dest = Path(dest_dir) if dest_dir is not None else video_paths[0].parent
+            dest.mkdir(parents=True, exist_ok=True)
+            zip_path = dest / f"{version.slug}-{version.lang}-{version.sub_id}.zip"
+            zip_path.write_bytes(payload)
+            for index, video in enumerate(video_paths):
+                results.append(
+                    (
+                        video,
+                        DownloadResult(
+                            zip_path=str(zip_path),
+                            srt_paths=[],
+                            version=version,
+                            bytes_downloaded=len(payload) if index == 0 else 0,
+                            target_video=str(video),
+                        ),
+                    )
+                )
+            return results
+        suffix = "" if no_suffix else (lang_suffix or _slugify_lang_suffix(version.lang))
+        for index, video in enumerate(video_paths):
+            try:
+                dest = Path(dest_dir) if dest_dir is not None else video.parent
+                srts = self._extract_subtitles(
+                    payload, dest, version, suffix, target_video=video, pack=True,
+                )
+                results.append(
+                    (
+                        video,
+                        DownloadResult(
+                            zip_path=None,
+                            srt_paths=[str(p) for p in srts],
+                            version=version,
+                            bytes_downloaded=len(payload) if index == 0 else 0,
+                            target_video=str(video),
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - per-video fallback is the caller's job
+                results.append((video, exc))
+        return results
+
+    def bulk_download(
+        self,
+        path: Union[str, Path, Sequence[Union[str, Path]]],
+        lang: Optional[str] = None,
+        dest_dir: Union[str, Path, None] = None,   # None -> beside each video
+        save_mode: str = "extract",                # extract | zip
+        lang_suffix: Optional[str] = None,
+        no_suffix: bool = False,
+        prefer_complete: bool = True,
+        pick_pack: Optional[
+            "Callable[[TitleResult, List[Path], List[Tuple[int, SubtitleVersion]]], Optional[SubtitleVersion]]"
+        ] = None,
+        min_score: int = 0,
+        dry_run: bool = False,
+        on_row: Optional["Callable[[Dict[str, Any]], None]"] = None,
+    ) -> List[Dict[str, Any]]:
+        """Bulk folder mode: one pack per season folder, per-video otherwise.
+
+        Plans *path* (a folder scanned for video files, or an explicit
+        video list) with :meth:`plan_bulk`, serves every episode group from
+        the covering pack the *pick_pack* callback chooses (the best-ranked
+        pack when the callback is ``None``), and downloads each chosen pack
+        exactly ONCE - every video still receives its own episode extracted
+        and renamed after the video file itself.  A group without a
+        covering pack, a video whose episode is missing from the chosen
+        archive, and plain movies all fall back to their per-video best
+        match.  That fallback is the bulk answer to "no season pack found":
+        the folder is still served completely.
+
+        *pick_pack* receives ``(title, videos, ranked_packs)`` and returns
+        the :class:`SubtitleVersion` to use, or ``None`` to keep the
+        per-video best for that group.  *on_row* is called with each result
+        row (same shape as the ``subz auto`` map rows, plus ``mode``) as
+        soon as it is ready.  Raises whatever ``find_videos`` raises for an
+        unusable *path*; per-video failures stay inside the rows.
+        """
+        if isinstance(path, (str, Path)):
+            from .matcher import find_videos
+
+            video_paths = find_videos(Path(path))
+        else:
+            video_paths = [Path(v) for v in path]
+        if not video_paths:
+            raise ValueError(f"no video files found under {path}")
+        lang_slug = resolve(lang) or DEFAULT_LANGUAGE
+        plan = self.plan_bulk(video_paths, lang=lang_slug)
+        rows: List[Dict[str, Any]] = []
+
+        def emit(row: Dict[str, Any]) -> None:
+            rows.append(row)
+            if on_row is not None:
+                try:
+                    on_row(row)
+                except Exception:  # noqa: BLE001 - UI callbacks must not break the batch
+                    pass
+
+        def dest_for(video: Path) -> Path:
+            return Path(dest_dir) if dest_dir is not None else video.parent
+
+        def per_video_row(video: Path, group: BulkGroupPlan, mode: str) -> Dict[str, Any]:
+            return {
+                "video": str(video),
+                "title": group.title.name if group.title else None,
+                "mode": mode,
+                "status": "ok",
+            }
+
+        def save_row(video: Path, group: BulkGroupPlan, mode: str, result: DownloadResult) -> Dict[str, Any]:
+            return {
+                "video": str(video),
+                "title": group.title.name if group.title else None,
+                "mode": mode,
+                "status": "saved",
+                "saved": result.srt_paths or ([result.zip_path] if result.zip_path else []),
+            }
+
+        def fallback_row(
+            video: Path, group: BulkGroupPlan, pack_error: str
+        ) -> None:
+            """Serve one video the pack archive could not, per-video best."""
+            best = group.best_by_video.get(video)
+            row = per_video_row(video, group, "pack-fallback")
+            if best is None:
+                row.update({"status": "error", "error": str(pack_error)})
+                emit(row)
+                return
+            row.update({"ref": best[0].ref, "score": best[1]})
+            if best[1] < min_score:
+                row.update(
+                    {
+                        "status": "skipped",
+                        "error": f"score {best[1]} is below min-score {min_score}",
+                    }
+                )
+                emit(row)
+                return
+            try:
+                result = self.download(
+                    best[0],
+                    dest_dir=dest_for(video),
+                    save_mode=save_mode,
+                    lang_suffix=lang_suffix,
+                    no_suffix=no_suffix,
+                    target_video=video,
+                )
+                row.update(save_row(video, group, "pack-fallback", result))
+            except Exception as exc:  # noqa: BLE001 - one bad video must not stop the batch
+                row.update({"status": "error", "error": f"pack: {pack_error}; per-video: {exc}"})
+            emit(row)
+
+        for group in plan.groups:
+            if group.title is None:
+                for video in group.videos:
+                    row = per_video_row(video, group, "per-video")
+                    row.update({"status": "not found", "error": group.error})
+                    emit(row)
+                continue
+            chosen: Optional[SubtitleVersion] = None
+            if prefer_complete:
+                # pick_pack is invoked for EVERY group (even without covering
+                # packs) so callers can surface the "no pack found - falling
+                # back to per-video" notice; returning None keeps the fallback.
+                if pick_pack is not None:
+                    chosen = pick_pack(group.title, group.videos, group.ranked_packs)
+                elif group.ranked_packs:
+                    chosen = group.ranked_packs[0][1]
+            group.chosen_pack = chosen
+
+            if chosen is not None:
+                todo: List[tuple] = []
+                for video in group.videos:
+                    row = per_video_row(video, group, "complete-pack")
+                    score = score_version(video.name, chosen)
+                    row.update({"ref": chosen.ref, "score": score})
+                    if score is None:
+                        row.update(
+                            {"status": "not found", "error": "pack does not cover this video"}
+                        )
+                        emit(row)
+                        continue
+                    if dry_run:
+                        row["status"] = "dry-run"
+                        emit(row)
+                        continue
+                    if score < min_score:
+                        row.update(
+                            {
+                                "status": "skipped",
+                                "error": f"score {score} is below min-score {min_score}",
+                            }
+                        )
+                        emit(row)
+                        continue
+                    todo.append((video, row))
+                if not todo:
+                    continue
+                pack_results = self.download_pack_once(
+                    chosen,
+                    [v for v, _row in todo],
+                    dest_dir=dest_dir,
+                    save_mode=save_mode,
+                    lang_suffix=lang_suffix,
+                    no_suffix=no_suffix,
+                )
+                for (video, row), (_v, result) in zip(todo, pack_results):
+                    if isinstance(result, Exception):
+                        fallback_row(video, group, str(result))
+                    else:
+                        # the todo row already carries ref + score; keep them
+                        row.update(
+                            {
+                                "status": "saved",
+                                "saved": result.srt_paths
+                                or ([result.zip_path] if result.zip_path else []),
+                            }
+                        )
+                        emit(row)
+            else:
+                for video in group.videos:
+                    row = per_video_row(video, group, "per-video")
+                    best = group.best_by_video.get(video)
+                    if best is None:
+                        row.update({"status": "not found", "error": "no matching subtitle"})
+                        emit(row)
+                        continue
+                    row.update({"ref": best[0].ref, "score": best[1]})
+                    if dry_run:
+                        row["status"] = "dry-run"
+                        emit(row)
+                        continue
+                    if best[1] < min_score:
+                        row.update(
+                            {
+                                "status": "skipped",
+                                "error": f"score {best[1]} is below min-score {min_score}",
+                            }
+                        )
+                        emit(row)
+                        continue
+                    try:
+                        result = self.download(
+                            best[0],
+                            dest_dir=dest_for(video),
+                            save_mode=save_mode,
+                            lang_suffix=lang_suffix,
+                            no_suffix=no_suffix,
+                            target_video=video,
+                        )
+                        row.update(save_row(video, group, "per-video", result))
+                    except Exception as exc:  # noqa: BLE001 - one bad video must not stop the batch
+                        row.update({"status": "error", "error": str(exc)})
+                    emit(row)
+        return rows
+
+    # ------------------------------------------------------------------
     # downloading
     # ------------------------------------------------------------------
+
+    def _fetch_zip_payload(
+        self,
+        version: SubtitleVersion,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> bytes:
+        """Stream one subtitle zip through the signed CDN link.
+
+        A 404 on the redirect target means the file is gone from the CDN
+        even though the site still issues the link; a stale upload comes
+        back as an S3 "NoSuchKey" XML body with HTTP 200.  Both surface as
+        :class:`DownloadError` telling the user to try another version.
+        """
+        response = self._get(
+            f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}/download",
+            stream=True,
+            referer=f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}",
+            not_found_ok=True,
+        )
+        if response is None:
+            raise DownloadError(
+                "subtitle file missing on the site's CDN (HTTP 404); "
+                "try another version"
+            )
+        total = response.headers.get("Content-Length")
+        total_bytes = int(total) if total and total.isdigit() else None
+
+        chunks: List[bytes] = []
+        received = 0
+        try:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    chunks.append(chunk)
+                    received += len(chunk)
+                    if on_progress:
+                        on_progress(received, total_bytes)
+        except requests.RequestException as exc:
+            raise NetworkError(f"download interrupted: {exc}") from exc
+        payload = b"".join(chunks)
+
+        if not payload.startswith(b"PK"):
+            snippet = payload[:200].decode("utf-8", "replace")
+            if "NoSuchKey" in snippet or "<Error>" in snippet:
+                raise DownloadError(
+                    "subtitle file missing on the site's CDN (stale upload); "
+                    "try another version"
+                )
+            raise DownloadError(
+                f"expected a zip archive, got {len(payload)} bytes of "
+                f"unexpected content: {snippet[:80]!r}"
+            )
+        return payload
 
     def download(
         self,
@@ -484,46 +905,10 @@ class SubZoneClient:
             zip_name = f"{version.slug}-{version.lang}-{version.sub_id}.zip"
         zip_path = dest / zip_name
         # A 404 here can come from the signed CDN link itself (the site still
-        # issues the redirect, but the file is gone) - surface it as the same
-        # "stale upload" problem users already know from the NoSuchKey case.
-        response = self._get(
-            f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}/download",
-            stream=True,
-            referer=f"/subtitles/{version.slug}/{version.lang}/{version.sub_id}",
-            not_found_ok=True,
-        )
-        if response is None:
-            raise DownloadError(
-                "subtitle file missing on the site's CDN (HTTP 404); "
-                "try another version"
-            )
-        total = response.headers.get("Content-Length")
-        total_bytes = int(total) if total and total.isdigit() else None
-
-        chunks: List[bytes] = []
-        received = 0
-        try:
-            for chunk in response.iter_content(chunk_size=65536):
-                if chunk:
-                    chunks.append(chunk)
-                    received += len(chunk)
-                    if on_progress:
-                        on_progress(received, total_bytes)
-        except requests.RequestException as exc:
-            raise NetworkError(f"download interrupted: {exc}") from exc
-        payload = b"".join(chunks)
-
-        if not payload.startswith(b"PK"):
-            snippet = payload[:200].decode("utf-8", "replace")
-            if "NoSuchKey" in snippet or "<Error>" in snippet:
-                raise DownloadError(
-                    "subtitle file missing on the site's CDN (stale upload); "
-                    "try another version"
-                )
-            raise DownloadError(
-                f"expected a zip archive, got {len(payload)} bytes of "
-                f"unexpected content: {snippet[:80]!r}"
-            )
+        # issues the redirect, but the file is gone) - _fetch_zip_payload
+        # surfaces it as the same "stale upload" problem users already know
+        # from the NoSuchKey case.
+        payload = self._fetch_zip_payload(version, on_progress)
 
         if save_mode == "zip":
             zip_path.write_bytes(payload)

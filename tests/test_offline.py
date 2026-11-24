@@ -1926,128 +1926,26 @@ def test_client_plan_prefer_complete_returns_empty_without_cover(tmp_path):
     assert client.plan_prefer_complete(videos, lang="english") == {}
 
 
-def test_tui_auto_screen_prefer_complete_checkbox_flow(tmp_path, config_env):
-    """The auto screen must offer the CLI's --prefer-complete: a checkbox
-    opens the ranked pack picker, the chosen pack plans the whole group,
-    rows carry a '(pack)' marker, and the choice is remembered."""
-    from pysubzone.config import load_tui_settings
-    from pysubzone.tui import AutoScreen, PackPickerScreen, SubZoneTUI
-    from textual.widgets import Button, Checkbox, DataTable, Input
-
-    for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
-        (tmp_path / name).touch()
-
-    complete = SubtitleVersion(
-        slug="show", lang="farsi_persian", sub_id="9",
-        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
-    )
-
-    class _PackClient(_WorkingClient):
-        def title_versions(self, slug, lang=None):
-            return [complete]
-
-        def find_complete_packs(self, videos, lang=None):
-            from pysubzone.client import SubZoneClient
-
-            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
-
-    client = _PackClient()
-
-    async def scenario():
-        app = SubZoneTUI(client)
-        async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+a")
-            await pilot.pause()
-            assert isinstance(app.screen, AutoScreen)
-            screen = app.screen
-            checkbox = screen.query_one("#auto-prefer-complete", Checkbox)
-            assert checkbox.value is False  # no config value, no remembered choice
-
-            screen.query_one("#auto-folder", Input).value = str(tmp_path)
-            checkbox.value = True
-            await pilot.pause()
-            screen.query_one("#auto-dry", Button).press()
-            await app.workers.wait_for_complete()  # planning worker
-            await pilot.pause()
-
-            # the ranked pack picker opens before anything runs
-            assert isinstance(app.screen, PackPickerScreen)
-            picker = app.screen
-            picker_table = picker.query_one("#picker-table", DataTable)
-            assert picker_table.row_count == 1
-
-            # Enter = use the selected pack for the whole group
-            await pilot.press("enter")
-            await pilot.pause()
-            await app.workers.wait_for_complete()  # batch worker
-            await pilot.pause()
-
-            assert screen.matches, "dry run produced no rows"
-            assert all(m.get("pack") for m in screen.matches), screen.matches
-            assert all(m["status"] == "dry run" for m in screen.matches)
-
-            # the choice survives into settings.json for the next session
-            assert load_tui_settings().get("prefer_complete") is True
-
-            # unticked: the normal per-video best match, no picker, no marker
-            checkbox.value = False
-            await pilot.pause()
-            screen.query_one("#auto-dry", Button).press()
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            assert isinstance(app.screen, AutoScreen)  # no picker this time
-            assert not any(m.get("pack") for m in screen.matches), screen.matches
-            assert load_tui_settings().get("prefer_complete") is False
-
-    _run_async(scenario())
-
-
 def test_tui_pack_picker_escape_falls_back_to_per_video_best(tmp_path, config_env):
-    """Esc in the pack picker must reject the pack for that group: every
-    video then keeps its normal per-video best match (sub_id 7)."""
-    from pysubzone.models import DownloadResult
-    from pysubzone.tui import AutoScreen, PackPickerScreen, SubZoneTUI
-    from textual.widgets import Button, Checkbox, Input
+    """Esc in the bulk pack picker must reject the pack for that group: every
+    video then keeps its normal per-video best match (v0.5.0 bulk flow)."""
+    from pysubzone.tui import BulkScreen, PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Input
 
     for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
         (tmp_path / name).touch()
-
-    complete = SubtitleVersion(
-        slug="show", lang="farsi_persian", sub_id="9",
-        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
-    )
-
-    class _PackClient(_WorkingClient):
-        def __init__(self):
-            super().__init__()
-            self.downloads: List[dict] = []
-
-        def title_versions(self, slug, lang=None):
-            return [complete]
-
-        def find_complete_packs(self, videos, lang=None):
-            from pysubzone.client import SubZoneClient
-
-            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
-
-        def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
-            self.downloads.append({"version": version, "video": target_video})
-            return DownloadResult(
-                zip_path=None, srt_paths=["/tmp/x.srt"], version=version,
-            )
-
-    client = _PackClient()
+    client = _BulkTuiClient(with_pack=True)
 
     async def scenario():
         app = SubZoneTUI(client)
-        async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+a")
+        async with app.run_test(size=(110, 46)) as pilot:
+            await pilot.press("ctrl+p")
             await pilot.pause()
             screen = app.screen
-            screen.query_one("#auto-folder", Input).value = str(tmp_path)
-            screen.query_one("#auto-prefer-complete", Checkbox).value = True
+            assert isinstance(screen, BulkScreen)
+            screen.query_one("#bulk-folder", Input).value = str(tmp_path)
             await pilot.pause()
-            screen.query_one("#auto-extract", Button).press()
+            screen.query_one("#bulk-extract", Button).press()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert isinstance(app.screen, PackPickerScreen)
@@ -2059,67 +1957,37 @@ def test_tui_pack_picker_escape_falls_back_to_per_video_best(tmp_path, config_en
             await pilot.pause()
 
             assert screen.matches, screen.matches
-            assert not any(m.get("pack") for m in screen.matches)
+            assert all(m["mode"] == "per-video" for m in screen.matches)
             assert all(m["status"] == "saved" for m in screen.matches)
-            assert {d["version"].sub_id for d in client.downloads} == {"7"}
+            assert client.pack_calls == []
+            assert len(client.video_calls) == 2
+            assert all(v.sub_id == "3" for v in client.video_versions)
 
     _run_async(scenario())
 
 
 def test_tui_pack_picker_second_choice_is_used(tmp_path, config_env):
-    """Selecting a non-first row in the picker must plan that exact pack."""
-    from pysubzone.models import DownloadResult
-    from pysubzone.scoring import covering_versions
-    from pysubzone.tui import PackPickerScreen, SubZoneTUI
-    from textual.widgets import Button, Checkbox, Input
+    """Selecting a non-first row in the bulk picker must serve the group from
+    that exact pack."""
+    from pysubzone.tui import BulkScreen, PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Input
 
     for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
         (tmp_path / name).touch()
-
-    complete = SubtitleVersion(
-        slug="show", lang="farsi_persian", sub_id="9",
-        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
-    )
-    span = SubtitleVersion(
-        slug="show", lang="farsi_persian", sub_id="8",
-        releases=["Show.S02E01-E05.1080p.WEBRip"], author="tester",
-    )
-
-    class _PackClient(_WorkingClient):
-        def __init__(self):
-            super().__init__()
-            self.downloads: List[dict] = []
-
-        def title_versions(self, slug, lang=None):
-            return [complete, span]
-
-        def find_complete_packs(self, videos, lang=None):
-            from pysubzone.client import SubZoneClient
-
-            return SubZoneClient.find_complete_packs(self, videos, lang=lang)
-
-        def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
-            self.downloads.append({"version": version, "video": target_video})
-            return DownloadResult(
-                zip_path=None, srt_paths=["/tmp/x.srt"], version=version,
-            )
-
-    client = _PackClient()
-    stems = ["Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"]
-    ranked = covering_versions(stems, [complete, span])
-    assert len(ranked) == 2, "both packs must cover the two episodes"
-    second_id = ranked[1][1].sub_id
+    client = _BulkTuiClient(with_pack=True, with_span=True)
+    assert len(client.ranked) == 2, "both packs must cover the two episodes"
+    second_id = client.ranked[1][1].sub_id
 
     async def scenario():
         app = SubZoneTUI(client)
-        async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+a")
+        async with app.run_test(size=(110, 46)) as pilot:
+            await pilot.press("ctrl+p")
             await pilot.pause()
             screen = app.screen
-            screen.query_one("#auto-folder", Input).value = str(tmp_path)
-            screen.query_one("#auto-prefer-complete", Checkbox).value = True
+            assert isinstance(screen, BulkScreen)
+            screen.query_one("#bulk-folder", Input).value = str(tmp_path)
             await pilot.pause()
-            screen.query_one("#auto-extract", Button).press()
+            screen.query_one("#bulk-extract", Button).press()
             await app.workers.wait_for_complete()
             await pilot.pause()
             assert isinstance(app.screen, PackPickerScreen)
@@ -2132,43 +2000,13 @@ def test_tui_pack_picker_second_choice_is_used(tmp_path, config_env):
             await pilot.pause()
 
             assert screen.matches
-            assert {d["version"].sub_id for d in client.downloads} == {second_id}
-            assert all(m.get("pack") for m in screen.matches)
+            assert all(m["mode"] == "complete-pack" for m in screen.matches)
+            assert all(m["status"] == "saved" for m in screen.matches)
+            assert len(client.pack_calls) == 1
+            assert client.pack_versions[0].sub_id == second_id
+            assert client.video_calls == []
 
     _run_async(scenario())
-
-
-def test_tui_auto_screen_checkbox_defaults_from_config(tmp_path, config_env):
-    """With defaults.prefer-complete=true and no remembered TUI choice the
-    checkbox starts checked; an explicit remembered choice wins."""
-    from pysubzone.config import save_config, save_tui_settings
-    from pysubzone.tui import SubZoneTUI
-    from textual.widgets import Checkbox
-
-    save_config({"defaults.prefer-complete": True})
-
-    async def first():
-        app = SubZoneTUI(_FakeClient())
-        async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+a")
-            await pilot.pause()
-            checkbox = app.screen.query_one("#auto-prefer-complete", Checkbox)
-            assert checkbox.value is True
-
-    _run_async(first())
-
-    # the remembered TUI choice overrides the config default
-    save_tui_settings({"prefer_complete": False})
-
-    async def second():
-        app = SubZoneTUI(_FakeClient())
-        async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+a")
-            await pilot.pause()
-            checkbox = app.screen.query_one("#auto-prefer-complete", Checkbox)
-            assert checkbox.value is False
-
-    _run_async(second())
 
 
 def test_scoring_covering_versions_ranks_all_candidates():
@@ -2606,3 +2444,586 @@ def test_cli_auto_passes_pack_flag_to_download(tmp_path, config_env, monkeypatch
     assert packs["Show.S02E01.1080p.WEBRip.mkv"] is True
     assert packs["Show.S02E05.1080p.WEBRip.mkv"] is True
     assert packs["Some.Movie.2023.1080p.BluRay.mkv"] is False
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: bulk folder mode (season pack first, one zip per season, per-video
+# fallback when no pack covers the group)
+# ---------------------------------------------------------------------------
+
+def _bulk_client(monkeypatch, versions, pack_payload=None, pack_error=None):
+    """A real client whose search/title/fetch methods are stubbed offline."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.models import TitleResult
+
+    client = SubZoneClient()
+    title = TitleResult(name="Arcane", slug="arcane", url="")
+    calls = {"search": 0, "title": 0, "fetch": 0}
+
+    def search_exact(query, lang=None):
+        calls["search"] += 1
+        return title
+
+    def title_versions(slug, lang=None):
+        calls["title"] += 1
+        return versions
+
+    def _fetch_zip_payload(version, on_progress=None):
+        calls["fetch"] += 1
+        if pack_error is not None:
+            raise pack_error
+        return pack_payload
+
+    client.search_exact = search_exact
+    client.title_versions = title_versions
+    client._fetch_zip_payload = _fetch_zip_payload
+    client._bulk_calls = calls
+    return client
+
+
+def _fake_per_video_download(writer):
+    """Replace client.download with a writer that produces the srt file."""
+
+    def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **kwargs):
+        from pysubzone.models import DownloadResult
+
+        video = Path(target_video)
+        dest = Path(dest_dir) if dest_dir else video.parent
+        dest.mkdir(parents=True, exist_ok=True)
+        out = dest / f"{video.with_suffix('').name}.en.srt"
+        out.write_text("per-video lines", encoding="utf-8")
+        return DownloadResult(
+            zip_path=None, srt_paths=[str(out)], version=version,
+            bytes_downloaded=10, target_video=str(video),
+        )
+
+    return download
+
+
+def test_bulk_download_serves_season_with_one_zip(tmp_path, monkeypatch):
+    """THE 0.5.0 regression: a 9-episode folder + one COMPLETE pack zip must
+    produce exactly 9 subtitle files (one per video, each video's own
+    episode) from exactly ONE zip download."""
+    from pysubzone.models import SubtitleVersion
+
+    videos = []
+    for ep in range(1, 10):
+        video = tmp_path / f"Arcane.S02E{ep:02d}.1080p.WEB-DL.mkv"
+        video.touch()
+        videos.append(video)
+    season_pack = SubtitleVersion(
+        slug="arcane", lang="english", sub_id="100",
+        releases=["Arcane.Season.2.COMPLETE.1080p.WEB-DL"], author="ASS.thetic",
+    )
+    payload = _zip_payload_with_contents({
+        f"Arcane.S02E{ep:02d}.en.srt": f"LINES-E{ep:02d}" for ep in range(1, 10)
+    })
+    client = _bulk_client(monkeypatch, versions=[season_pack], pack_payload=payload)
+
+    rows = client.bulk_download(videos, lang="english")
+
+    assert client._bulk_calls["fetch"] == 1, "the pack zip must be downloaded exactly once"
+    assert len(rows) == 9
+    assert all(r["status"] == "saved" for r in rows), rows
+    assert all(r["mode"] == "complete-pack" for r in rows)
+    # rows carry the pack ref and the per-video score (map JSON usefulness)
+    assert all(r.get("ref") == season_pack.ref for r in rows)
+    assert all(isinstance(r.get("score"), int) and r["score"] >= 0 for r in rows)
+    for ep in range(1, 10):
+        out = tmp_path / f"Arcane.S02E{ep:02d}.1080p.WEB-DL.en.srt"
+        assert out.is_file(), f"missing subtitle for E{ep:02d}"
+        assert out.read_text(encoding="utf-8") == f"LINES-E{ep:02d}"
+    assert len(list(tmp_path.glob("*.srt"))) == 9  # and nothing else
+
+
+def test_bulk_pack_missing_episode_falls_back_for_that_video(tmp_path, monkeypatch):
+    """A pack archive that lacks one episode keeps the other pack rows and
+    recovers the missing one via its per-video best."""
+    from pysubzone.models import SubtitleVersion
+
+    videos = []
+    for ep in range(1, 4):
+        video = tmp_path / f"Arcane.S02E{ep:02d}.1080p.WEB-DL.mkv"
+        video.touch()
+        videos.append(video)
+    season_pack = SubtitleVersion(
+        slug="arcane", lang="english", sub_id="100",
+        releases=["Arcane.Season.2.COMPLETE.1080p.WEB-DL"], author="ASS.thetic",
+    )
+    payload = _zip_payload_with_contents({
+        "Arcane.S02E01.en.srt": "LINES-E01",
+        "Arcane.S02E02.en.srt": "LINES-E02",
+        # E03 is missing from the archive on purpose
+    })
+    client = _bulk_client(monkeypatch, versions=[season_pack], pack_payload=payload)
+    monkeypatch.setattr(
+        type(client), "download", _fake_per_video_download(None), raising=False
+    )
+
+    rows = client.bulk_download(videos, lang="english")
+
+    assert len(rows) == 3
+    modes = {Path(r["video"]).name: r["mode"] for r in rows}
+    statuses = {Path(r["video"]).name: r["status"] for r in rows}
+    assert modes["Arcane.S02E01.1080p.WEB-DL.mkv"] == "complete-pack"
+    assert modes["Arcane.S02E02.1080p.WEB-DL.mkv"] == "complete-pack"
+    assert modes["Arcane.S02E03.1080p.WEB-DL.mkv"] == "pack-fallback"
+    assert all(status == "saved" for status in statuses.values()), statuses
+    assert len(list(tmp_path.glob("*.srt"))) == 3
+
+
+def test_bulk_download_falls_back_per_video_without_pack(tmp_path, monkeypatch):
+    """No covering pack -> pick_pack sees an empty ranking, the group is
+    served per-video, and the run still completes."""
+    from pysubzone.models import SubtitleVersion
+
+    videos = []
+    for ep in (1, 2):
+        video = tmp_path / f"Arcane.S02E0{ep}.1080p.WEB-DL.mkv"
+        video.touch()
+        videos.append(video)
+    versions = [
+        SubtitleVersion(slug="arcane", lang="english", sub_id="1",
+                        releases=["Arcane.S02E01.1080p.WEB-DL"], author="a"),
+        SubtitleVersion(slug="arcane", lang="english", sub_id="2",
+                        releases=["Arcane.S02E02.1080p.WEB-DL"], author="b"),
+    ]
+    client = _bulk_client(monkeypatch, versions=versions, pack_payload=b"PK-unused")
+    monkeypatch.setattr(
+        type(client), "download", _fake_per_video_download(None), raising=False
+    )
+    seen_rankings = []
+
+    def pick_pack(title, group, ranked):
+        seen_rankings.append(list(ranked))
+        return None
+
+    rows = client.bulk_download(videos, lang="english", pick_pack=pick_pack)
+
+    assert seen_rankings == [[]], "the callback must be told there is no pack"
+    assert len(rows) == 2
+    assert all(r["mode"] == "per-video" and r["status"] == "saved" for r in rows)
+    assert (tmp_path / "Arcane.S02E01.1080p.WEB-DL.en.srt").is_file()
+    assert (tmp_path / "Arcane.S02E02.1080p.WEB-DL.en.srt").is_file()
+
+
+def test_bulk_movies_never_get_packs(tmp_path, monkeypatch):
+    """Movies pin no season/episode: pack machinery never touches them."""
+    from pysubzone.models import SubtitleVersion
+
+    movies = [
+        tmp_path / "Some.Movie.2023.1080p.BluRay.mkv",
+        tmp_path / "Another.Movie.2024.720p.WEBRip.mkv",
+    ]
+    for movie in movies:
+        movie.touch()
+    season_pack = SubtitleVersion(
+        slug="arcane", lang="english", sub_id="100",
+        releases=["Arcane.Season.2.COMPLETE.1080p.WEB-DL"], author="x",
+    )
+    client = _bulk_client(
+        monkeypatch, versions=[season_pack],
+        pack_payload=_zip_payload(["Arcane.S02E01.en.srt"]),
+    )
+    monkeypatch.setattr(
+        type(client), "download", _fake_per_video_download(None), raising=False
+    )
+
+    rows = client.bulk_download(movies, lang="english")
+
+    assert client._bulk_calls["fetch"] == 0  # pack zip never fetched
+    assert all(r["mode"] == "per-video" and r["status"] == "saved" for r in rows)
+
+
+def test_plan_bulk_searches_once_per_title(tmp_path, monkeypatch):
+    """A nine-episode folder of one show costs ONE search + ONE title fetch."""
+    from pysubzone.models import SubtitleVersion
+
+    videos = [tmp_path / f"Arcane.S02E{ep:02d}.1080p.mkv" for ep in range(1, 10)]
+    videos.append(tmp_path / "Other.Show.S01E01.720p.mkv")
+    season_pack = SubtitleVersion(slug="arcane", lang="english", sub_id="100",
+                                  releases=["Arcane.Season.2.COMPLETE"])
+    client = _bulk_client(monkeypatch, versions=[season_pack], pack_payload=b"PK")
+
+    plan = client.plan_bulk(videos, lang="english")
+
+    assert client._bulk_calls["search"] == 2  # "Arcane" + "Other Show"
+    assert client._bulk_calls["title"] == 2
+    assert len(plan.groups) == 2
+    big = next(g for g in plan.groups if len(g.videos) == 9)
+    assert big.pinned is True
+    assert big.ranked_packs  # the COMPLETE pack covers all nine
+
+
+def test_bulk_download_dry_run_and_min_score(tmp_path, monkeypatch):
+    from pysubzone.models import SubtitleVersion
+
+    videos = []
+    for ep in (1, 2):
+        video = tmp_path / f"Arcane.S02E0{ep}.1080p.WEB-DL.mkv"
+        video.touch()
+        videos.append(video)
+    season_pack = SubtitleVersion(slug="arcane", lang="english", sub_id="100",
+                                  releases=["Arcane.Season.2.COMPLETE.1080p.WEB-DL"])
+    payload = _zip_payload(["Arcane.S02E01.en.srt", "Arcane.S02E02.en.srt"])
+    client = _bulk_client(monkeypatch, versions=[season_pack], pack_payload=payload)
+
+    rows = client.bulk_download(videos, lang="english", dry_run=True)
+    assert client._bulk_calls["fetch"] == 0
+    assert all(r["status"] == "dry-run" and r["mode"] == "complete-pack" for r in rows)
+
+    rows = client.bulk_download(videos, lang="english", min_score=10000)
+    assert client._bulk_calls["fetch"] == 0
+    assert all(r["status"] == "skipped" for r in rows)
+
+
+def test_download_pack_once_zip_mode_writes_single_zip(tmp_path, monkeypatch):
+    from pysubzone.models import SubtitleVersion
+
+    videos = [tmp_path / f"Arcane.S02E0{ep}.mkv" for ep in (1, 2, 3)]
+    for video in videos:
+        video.touch()
+    version = SubtitleVersion(slug="arcane", lang="english", sub_id="100",
+                              releases=["Arcane.Season.2.COMPLETE"])
+    payload = _zip_payload(["Arcane.S02E01.en.srt"])
+    client = _bulk_client(monkeypatch, versions=[version], pack_payload=payload)
+
+    results = client.download_pack_once(version, videos, save_mode="zip")
+
+    assert len(results) == 3
+    zips = list(tmp_path.glob("*.zip"))
+    assert len(zips) == 1  # the archive is written exactly once
+    assert all(isinstance(r, tuple) or True for r in results)
+    first_video, first_result = results[0]
+    assert first_result.zip_path == str(zips[0])
+    assert first_result.bytes_downloaded > 0
+    assert all(r.bytes_downloaded == 0 for _v, r in results[1:])
+
+
+# --- bulk CLI ---------------------------------------------------------------
+
+class _BulkCliStub:
+    """Offline stub backing the `subz bulk` command tests."""
+
+    def __init__(self, ranked=True):
+        from pysubzone.models import SubtitleVersion, TitleResult
+
+        self.title = TitleResult(name="Show", slug="show", url="")
+        self.pack = SubtitleVersion(slug="show", lang="english", sub_id="9",
+                                    releases=["Show.S02.COMPLETE.1080p"], author="x")
+        self.per_video = SubtitleVersion(slug="show", lang="english", sub_id="3",
+                                         releases=["Show.S02E01.1080p"], author="y")
+        self.ranked = ranked
+        self.pack_calls = []
+        self.video_calls = []
+        self.kwargs_log = []
+
+    def plan_bulk(self, videos, lang=None):
+        from pysubzone.models import BulkGroupPlan, BulkPlan
+
+        ranked_packs = [(30, self.pack)] if self.ranked else []
+        group = BulkGroupPlan(
+            title=self.title, videos=list(videos), ranked_packs=ranked_packs,
+            best_by_video={v: (self.per_video, 55) for v in videos}, pinned=True,
+        )
+        return BulkPlan(groups=[group])
+
+    def download_pack_once(self, version, videos, dest_dir=None, save_mode="extract", **kwargs):
+        from pysubzone.models import DownloadResult
+
+        self.pack_calls.append(list(videos))
+        out = []
+        for index, video in enumerate(videos):
+            dest = Path(dest_dir) if dest_dir else video.parent
+            dest.mkdir(parents=True, exist_ok=True)
+            f = dest / f"{video.with_suffix('').name}.en.srt"
+            f.write_text("pack lines", encoding="utf-8")
+            out.append((video, DownloadResult(
+                zip_path=None, srt_paths=[str(f)], version=version,
+                bytes_downloaded=1000 if index == 0 else 0, target_video=str(video),
+            )))
+        return out
+
+    def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **kwargs):
+        from pysubzone.models import DownloadResult
+
+        self.video_calls.append(target_video)
+        video = Path(target_video)
+        dest = Path(dest_dir) if dest_dir else video.parent
+        dest.mkdir(parents=True, exist_ok=True)
+        f = dest / f"{video.with_suffix('').name}.en.srt"
+        f.write_text("per-video lines", encoding="utf-8")
+        return DownloadResult(zip_path=None, srt_paths=[str(f)], version=version,
+                              bytes_downloaded=10, target_video=str(video))
+
+    def bulk_download(self, videos, **kwargs):
+        from pysubzone.client import SubZoneClient
+
+        self.kwargs_log.append(kwargs)
+        return SubZoneClient.bulk_download(self, videos, **kwargs)
+
+
+def test_cli_bulk_pack_serves_whole_folder(tmp_path, config_env, monkeypatch):
+    """`subz bulk` with a covering pack: one download_pack_once call for the
+    whole folder, every row served from the pack, clean JSON out."""
+    import json as _json
+
+    from pysubzone.cli import app
+
+    for ep in (1, 2, 3):
+        (tmp_path / f"Show.S02E0{ep}.1080p.mkv").touch()
+    stub = _BulkCliStub(ranked=True)
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(app, ["bulk", str(tmp_path), "-y", "--json"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    assert data["summary"] == {"total": 3, "saved": 3}
+    assert all(r["mode"] == "complete-pack" for r in data["results"])
+    assert len(stub.pack_calls) == 1  # ONE pack download for the whole folder
+    assert len(stub.pack_calls[0]) == 3
+
+
+def test_cli_bulk_fallback_without_pack(tmp_path, config_env, monkeypatch):
+    """Without covering packs the CLI falls back per-video and reports it."""
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.mkv").touch()
+    (tmp_path / "Show.S02E02.1080p.mkv").touch()
+    stub = _BulkCliStub(ranked=False)
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(app, ["bulk", str(tmp_path), "-y", "--map-json", "-"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)  # stdout stays pure JSON
+    assert data["prefer_complete"] is True
+    assert data["summary"] == {"total": 2, "saved": 2}
+    assert all(r["mode"] == "per-video" for r in data["results"])
+    assert len(stub.video_calls) == 2
+    assert len(stub.pack_calls) == 0
+
+
+def test_cli_bulk_no_packs_flag_forces_per_video(tmp_path, config_env, monkeypatch):
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.mkv").touch()
+    stub = _BulkCliStub(ranked=True)
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(app, ["bulk", str(tmp_path), "-y", "--no-packs", "--json"])
+    assert result.exit_code == 0, result.output
+    assert stub.kwargs_log[0]["prefer_complete"] is False
+
+    stub.kwargs_log.clear()
+    result = _runner().invoke(app, ["bulk", str(tmp_path), "-y", "--json"])
+    assert result.exit_code == 0, result.output
+    assert stub.kwargs_log[0]["prefer_complete"] is True
+
+
+def test_cli_bulk_dry_run_downloads_nothing(tmp_path, config_env, monkeypatch):
+    import json as _json
+
+    from pysubzone.cli import app
+
+    (tmp_path / "Show.S02E01.1080p.mkv").touch()
+    stub = _BulkCliStub(ranked=True)
+    monkeypatch.setattr("pysubzone.cli._client", lambda settings: stub)
+
+    result = _runner().invoke(app, ["bulk", str(tmp_path), "--dry-run", "--json"])
+    assert result.exit_code == 0, result.output
+    data = _json.loads(result.output)
+    assert data["summary"] == {"total": 1, "dry-run": 1}
+    assert data["dry_run"] is True
+    assert stub.pack_calls == [] and stub.video_calls == []
+
+
+def test_cli_bulk_lists_bulk_in_help(config_env):
+    from pysubzone.cli import app
+
+    help_text = _runner().invoke(app, ["--help"]).output
+    assert "bulk" in help_text
+    bulk_help = _runner().invoke(app, ["bulk", "--help"]).output
+    for option in ("--no-packs", "--map-json", "--dry-run", "--min-score"):
+        assert option in bulk_help, f"missing {option}"
+
+
+def test_cli_politeness_defaults_are_on():
+    """v0.5.0: every command paces requests (1s) and caches pages (300s)."""
+    from pysubzone.cli import DEFAULT_CACHE_TTL, DEFAULT_MIN_INTERVAL
+
+    assert DEFAULT_MIN_INTERVAL == 1.0
+    assert DEFAULT_CACHE_TTL == 300.0
+
+
+# --- bulk TUI ---------------------------------------------------------------
+
+class _BulkTuiClient:
+    """plan_bulk / download_pack_once / download succeed, offline only."""
+
+    def __init__(self, with_pack: bool = True, with_span: bool = False) -> None:
+        from pysubzone.models import SubtitleVersion, TitleResult
+
+        self.title = TitleResult(name="Show", slug="show", url="")
+        self.pack = SubtitleVersion(slug="show", lang="english", sub_id="9",
+                                    releases=["Show.S02.COMPLETE.1080p"], author="x")
+        self.span = SubtitleVersion(slug="show", lang="english", sub_id="8",
+                                    releases=["Show.S02E01-E05.1080p.WEBRip"], author="y")
+        self.per_video = SubtitleVersion(slug="show", lang="english", sub_id="3",
+                                         releases=["Show.S02E01.1080p"], author="y")
+        self.with_pack = with_pack
+        self.with_span = with_span
+        self.pack_calls: List[List[Path]] = []
+        self.pack_versions: List[SubtitleVersion] = []
+        self.video_calls: List[Path] = []
+        self.video_versions: List[SubtitleVersion] = []
+
+    @property
+    def ranked(self):
+        packs = [(30, self.pack)]
+        if self.with_span:
+            packs.append((20, self.span))
+        return packs
+
+    def plan_bulk(self, videos, lang=None):
+        from pysubzone.models import BulkGroupPlan, BulkPlan
+
+        ranked = self.ranked if self.with_pack else []
+        group = BulkGroupPlan(
+            title=self.title, videos=list(videos), ranked_packs=ranked,
+            best_by_video={v: (self.per_video, 55) for v in videos}, pinned=bool(ranked),
+        )
+        return BulkPlan(groups=[group])
+
+    def download_pack_once(self, version, videos, dest_dir=None, save_mode="extract", **k):
+        from pysubzone.models import DownloadResult
+
+        self.pack_calls.append(list(videos))
+        self.pack_versions.append(version)
+        out = []
+        for index, video in enumerate(videos):
+            dest = Path(dest_dir) if dest_dir else video.parent
+            dest.mkdir(parents=True, exist_ok=True)
+            f = dest / f"{video.with_suffix('').name}.en.srt"
+            f.write_text("pack lines", encoding="utf-8")
+            out.append((video, DownloadResult(
+                zip_path=None, srt_paths=[str(f)], version=version,
+                bytes_downloaded=100 if index == 0 else 0, target_video=str(video),
+            )))
+        return out
+
+    def download(self, version, dest_dir=".", save_mode="extract", target_video=None, **k):
+        from pysubzone.models import DownloadResult
+
+        self.video_calls.append(Path(target_video))
+        self.video_versions.append(version)
+        video = Path(target_video)
+        dest = Path(dest_dir) if dest_dir else video.parent
+        dest.mkdir(parents=True, exist_ok=True)
+        f = dest / f"{video.with_suffix('').name}.en.srt"
+        f.write_text("per-video lines", encoding="utf-8")
+        return DownloadResult(zip_path=None, srt_paths=[str(f)], version=version,
+                              bytes_downloaded=10, target_video=str(video))
+
+
+def test_tui_ctrl_p_opens_bulk_screen(config_env):
+    from pysubzone.tui import BulkScreen, SubZoneTUI
+
+    async def scenario():
+        app = SubZoneTUI(_FakeClient())
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert isinstance(app.screen, BulkScreen)
+
+    _run_async(scenario())
+
+
+def test_tui_auto_screen_has_no_pack_checkbox():
+    """v0.5.0: prefer-complete moved out of auto-match into the bulk screen."""
+    import inspect
+
+    from pysubzone.tui import AutoScreen
+
+    source = inspect.getsource(AutoScreen)
+    assert "Checkbox" not in source
+    assert "prefer" not in source.lower()
+
+
+def test_tui_bulk_screen_dry_run_then_pack_extract(tmp_path, config_env):
+    """Bulk flow: dry run plans, 'Bulk & extract' downloads the pack once."""
+    from pysubzone.tui import BulkScreen, PackPickerScreen, SubZoneTUI
+    from textual.widgets import Button, Input
+
+    for ep in (1, 2):
+        (tmp_path / f"Show.S02E0{ep}.1080p.mkv").touch()
+    client = _BulkTuiClient(with_pack=True)
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 46)) as pilot:
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert isinstance(app.screen, BulkScreen)
+            screen = app.screen
+            screen.query_one("#bulk-folder", Input).value = str(tmp_path)
+            await pilot.pause()
+
+            # dry run: picker appears, Enter accepts the best pack
+            screen.query_one("#bulk-dry", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, PackPickerScreen)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert all(r["status"] == "dry run" for r in screen.matches), screen.matches
+            assert all(r["mode"] == "complete-pack" for r in screen.matches)
+            assert client.pack_calls == []  # dry run downloads nothing
+
+            # real run: picker again, Enter, pack extracted for both videos
+            screen.query_one("#bulk-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, PackPickerScreen)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert all(r["status"] == "saved" for r in screen.matches), screen.matches
+            assert len(client.pack_calls) == 1  # ONE pack download
+            assert len(client.pack_calls[0]) == 2
+            assert client.video_calls == []  # no per-video downloads needed
+            for ep in (1, 2):
+                out = tmp_path / f"Show.S02E0{ep}.1080p.en.srt"
+                assert out.is_file()
+
+    _run_async(scenario())
+
+
+def test_tui_bulk_screen_falls_back_without_pack(tmp_path, config_env):
+    """No covering packs: no picker at all, per-video fallback serves both."""
+    from pysubzone.tui import BulkScreen, SubZoneTUI
+    from textual.widgets import Button, Input
+
+    for ep in (1, 2):
+        (tmp_path / "Show.S02E01.1080p.mkv" if ep == 1 else tmp_path / "Show.S02E02.1080p.mkv").touch()
+    client = _BulkTuiClient(with_pack=False)
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 46)) as pilot:
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BulkScreen)
+            screen.query_one("#bulk-folder", Input).value = str(tmp_path)
+            screen.query_one("#bulk-extract", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert all(r["mode"] == "per-video" for r in screen.matches)
+            assert all(r["status"] == "saved" for r in screen.matches)
+            assert len(client.video_calls) == 2
+            assert client.pack_calls == []
+
+    _run_async(scenario())

@@ -8,7 +8,8 @@ contract.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from .languages import display_name
 
@@ -160,6 +161,59 @@ class SubtitleDetails:
             "release_type": self.release_type,
             "downloads": self.downloads,
         }
+
+
+@dataclass
+class BulkGroupPlan:
+    """One same-title group of videos produced by the bulk planner.
+
+    ``ranked_packs`` holds every version whose release lines cover every
+    video of the group (best first) - usually one COMPLETE season zip plus
+    act packs.  ``best_by_video`` carries each video's own best match so a
+    group without a covering pack (or a video the pack archive cannot
+    serve) falls back to the per-video match without extra searches.
+    ``error`` is set when the group's title resolution failed, in which
+    case every video of the group reports that failure.
+    """
+
+    title: Optional[TitleResult]                 # None when the search failed
+    videos: List[Path]
+    ranked_packs: List[Tuple[int, "SubtitleVersion"]] = field(default_factory=list)
+    best_by_video: Dict[Path, Tuple["SubtitleVersion", int]] = field(default_factory=dict)
+    chosen_pack: Optional["SubtitleVersion"] = None  # None -> per-video best
+    pinned: bool = False                          # every video pins season AND episode
+    error: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "title": self.title.as_dict() if self.title else None,
+            "videos": [str(v) for v in self.videos],
+            "ranked_packs": [
+                {"score": score, **version.as_dict()}
+                for score, version in self.ranked_packs
+            ],
+            "best_by_video": {
+                str(video): {**version.as_dict(), "score": score}
+                for video, (version, score) in self.best_by_video.items()
+            },
+            "chosen_pack": self.chosen_pack.as_dict() if self.chosen_pack else None,
+            "pinned": self.pinned,
+            "error": self.error,
+        }
+
+
+@dataclass
+class BulkPlan:
+    """The complete bulk-mode plan for a folder scan."""
+
+    groups: List[BulkGroupPlan] = field(default_factory=list)
+
+    @property
+    def videos(self) -> List[Path]:
+        return [video for group in self.groups for video in group.videos]
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"groups": [group.as_dict() for group in self.groups]}
 
 
 @dataclass

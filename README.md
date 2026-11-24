@@ -22,9 +22,10 @@ Inspired by [PyAddic7](https://github.com/mackeos/PyAddic7), which works with ad
 - **Browse subtitle versions** — see the uploads available for a title, with language filtering.
 - **Download subtitles** — download a specific upload by reference or URL, or grab the newest uploads from a title page.
 - **Match video files automatically** — search for suitable subtitles based on release names, including episode number, resolution, source, and release group.
+- **Bulk folder mode** — point `subz bulk` (or the TUI's Bulk screen) at a whole season folder: one COMPLETE-season pack is chosen interactively, downloaded exactly once, and every episode still gets its own correctly named subtitle file. No pack? Episodes are matched individually instead.
 - **Discover languages** — list every language the engine understands, with aliases and short codes.
 - **Script it** — every command speaks `--json`, `subz auto` can export a full result map, and the API ships type hints (`py.typed`) plus an async client.
-- **Stay polite** — built-in rate limiting and page caching keep request traffic friendly to the site.
+- **Stay polite** — requests are rate-limited (1s apart by default) and fetched pages are cached (5 minutes) to keep traffic friendly to the site; both are configurable.
 - **Use it your way** — choose the Python API, the command-line interface, or the interactive terminal UI.
 
 The CLI is built with [Typer](https://typer.tiangolo.com/) and Rich, while the interactive TUI is powered by [Textual](https://github.com/Textualize/textual).
@@ -89,6 +90,8 @@ subz filename FILE [-l LANG] [--no-download]  Find the best subtitle for one vid
             [--min-score N]
 subz auto PATH [-l LANG] [-o DIR] [--out-cwd]    Match videos in a folder
             [--min-score N] [--parallel 1-8] [--map-json FILE|-]
+subz bulk PATH [-l LANG] [-o DIR] [--out-cwd]    Season-pack first bulk mode
+            [--no-packs] [--min-score N] [--map-json FILE|-]
 subz popular [--mode popular|latest]           Browse popular or latest uploads
             [-t all|film|series|music] [-p PAGE]
 subz languages [--json]                        List known languages + aliases
@@ -102,8 +105,8 @@ Global options:
 - `--user-agent` — set the HTTP user agent.
 - `--timeout` — configure the request timeout.
 - `--retries` — configure retry attempts.
-- `--min-interval` — minimum seconds between HTTP requests (politeness rate limit).
-- `--cache-ttl` — seconds to keep fetched pages in an in-memory cache.
+- `--min-interval` — minimum seconds between HTTP requests (politeness rate limit; default 1).
+- `--cache-ttl` — seconds to keep fetched pages in an in-memory cache (default 300).
 - `-v`, `--verbose` — enable verbose output.
 
 Every data command supports `--json` for scripting and automation.
@@ -218,7 +221,29 @@ Quality and speed controls:
 
 Both options can also be set permanently in the [config file](#configuration-file) as `defaults.min-score` and `defaults.workers`.
 
-- `--prefer-complete` — opt-in batch mode: when one same-season pack covers **every** episode video in the folder (e.g. a `COMPLETE` season zip whose release lines name the folder's season), it is preferred for all of them and each video still receives its own episode extracted and renamed. Every covering pack is listed with its match score before the run; in an interactive terminal with more than one candidate you choose which one serves the folder (Enter = best, `0` = per-video best), while `-y`, `--json`, `--map-json -` and `--dry-run` stay non-interactive and take the best pack. Movies and videos without a pinned season/episode are never touched. Off by default; set permanently as `defaults.prefer-complete`. The TUI auto-match screen has the same mode as a **"Prefer complete season pack"** checkbox with a ranked pack-picker screen (remembered between sessions, defaulting to `defaults.prefer-complete`).
+- `--prefer-complete` — opt-in batch mode: when one same-season pack covers **every** episode video in the folder (e.g. a `COMPLETE` season zip whose release lines name the folder's season), it is preferred for all of them and each video still receives its own episode extracted and renamed. Every covering pack is listed with its match score before the run; in an interactive terminal with more than one candidate you choose which one serves the folder (Enter = best, `0` = per-video best), while `-y`, `--json`, `--map-json -` and `--dry-run` stay non-interactive and take the best pack. Movies and videos without a pinned season/episode are never touched. Off by default; set permanently as `defaults.prefer-complete`.
+
+For whole season folders the dedicated **bulk mode** is the better tool:
+
+### Bulk folder mode (`subz bulk`)
+
+`subz bulk PATH` is season-pack first: the folder's videos are grouped per show, every subtitle pack covering a whole group is listed ranked, and the chosen pack is downloaded **exactly once** — each episode still gets its own subtitle file extracted from the archive and renamed after its video. One 9-episode season therefore costs one zip download and produces exactly nine subtitle files.
+
+```bash
+# Plan a season folder: shows the groups, the ranked packs, downloads nothing
+subz bulk /media/shows/Arcane.S02 -l fa --dry-run
+
+# Serve the folder from the best pack without asking
+subz bulk /media/shows/Arcane.S02 -l fa -y
+
+# Pick the pack interactively (Enter = best, 0 = per-video best)
+subz bulk /media/shows/Arcane.S02 -l fa
+
+# Plain per-video matching, no pack logic
+subz bulk /media/shows/Arcane.S02 -l fa --no-packs
+```
+
+When **no pack covers** a group — or a video's episode is missing from the chosen archive — the affected videos fall back to their per-video best match automatically, so the folder is still served completely; the summary reports which rows came from the pack and which were matched individually. Movies in the same folder are never touched by pack logic. Like `subz auto`, bulk mode speaks `--json`, `--map-json FILE|-`, `--min-score`, `-o/--out` and `--zip`.
 
 For scripting, `--map-json` writes the complete per-video result map — every match, score, status and saved path, plus a summary — as JSON:
 
@@ -284,10 +309,11 @@ The TUI covers everything the CLI can do:
 1. **Search** — enter a query to see matching titles.
 2. **Versions** — select a title to browse its uploads, filter by language.
 3. **Download dialog** — pick a destination folder, optionally rename the output file in the *Save as* field, and choose to extract subtitles or keep the ZIP archive. A live progress bar tracks the download.
-4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download matching subtitles for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. The **"Prefer complete season pack"** checkbox mirrors the CLI's `--prefer-complete`: when one same-season pack covers every episode video in the folder, a ranked picker screen lists every covering pack (fit score, release name, uploader) — Enter uses the selected pack for the whole folder, Esc keeps the per-video best — and each video still gets its own episode extracted and renamed. Rows served from a pack are marked `(pack)` in the table. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
-5. **Browse** (`Ctrl+B`) — the `subz popular` flow: page through popular and latest uploads, filter by media type, and download directly.
+4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download the per-video best matching subtitle for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
+5. **Bulk packs** (`Ctrl+P`, works from any screen) — the `subz bulk` flow: season-pack first bulk mode for whole folders. Videos are grouped per show, every covering COMPLETE-season pack is listed in a ranked picker screen (fit score, release name, uploader) — Enter uses the selected pack for the whole group, Esc keeps the per-video best — the pack is downloaded exactly once, and each episode gets its own subtitle extracted and renamed. Groups without a covering pack (and movies) fall back to the per-video best automatically, with a note in the status line.
+6. **Browse** (`Ctrl+B`) — the `subz popular` flow: page through popular and latest uploads, filter by media type, and download directly.
 
-The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and auto-match screen come back pre-filled; the auto-match checkbox state is remembered the same way.
+The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and the auto/bulk screens come back pre-filled.
 
 **Keyboard shortcuts**
 
@@ -295,6 +321,7 @@ The last destination folder and language filter are remembered between sessions 
 |---|---|
 | `Ctrl+S` | Search screen |
 | `Ctrl+A` | Auto-match screen (works everywhere, even while typing) |
+| `Ctrl+P` | Bulk packs screen (works everywhere, even while typing) |
 | `Ctrl+B` | Browse screen |
 | `Esc` | Go back or close the current view |
 | `r` | Refresh versions / re-scan the folder |

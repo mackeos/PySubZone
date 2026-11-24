@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subf2m"
+version = "0.5.0"
+description = "Compatibility alias: installs pysubzone, the Python API/CLI/TUI subtitle downloader for subzone.ir (Subf2m subtitle database engine)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Mackeos", email = "29227187+mackeos@users.noreply.github.com" },
+]
+keywords = [
+    "subf2m",
+    "subzone",
+    "subzone.ir",
+    "subtitles",
+    "subtitle-downloader",
+    "compatibility",
+    "alias",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "pysubzone>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mackeos/PySubZone"
+Repository = "https://github.com/mackeos/PySubZone"
+Issues = "https://github.com/mackeos/PySubZone/issues"
+
+[project.scripts]
+subf2m = "pysubzone.cli:main"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+packages = ["subf2m"]

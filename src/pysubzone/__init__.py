@@ -26,6 +26,8 @@ from .exceptions import (
 )
 from .models import (
     BrowseEntry,
+    BulkGroupPlan,
+    BulkPlan,
     DownloadResult,
     SubtitleDetails,
     SubtitleVersion,
@@ -34,7 +36,7 @@ from .models import (
 )
 from .scoring import DEFAULT_WEIGHTS, ScoreWeights
 
-__version__ = "0.4.7"
+__version__ = "0.5.0"
 
 __all__ = [
     "SubZoneClient",
@@ -51,6 +53,8 @@ __all__ = [
     "SubtitleVersion",
     "SubtitleDetails",
     "DownloadResult",
+    "BulkGroupPlan",
+    "BulkPlan",
     "BrowseEntry",
     "ScoreWeights",
     "DEFAULT_WEIGHTS",

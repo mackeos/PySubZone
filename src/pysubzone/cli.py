@@ -11,6 +11,7 @@ results: every command accepts ``--json`` and uses stable exit codes
     subz filename Dexter.Resurrection.S02E01.1080p.AMZN.WEB-DL-NTb.mkv
     subz auto /media/shows --dry-run
     subz auto /media/shows --map-json results.json
+    subz bulk /media/shows/Arcane.S02 -y        # season pack first, one zip
     subz title dexter-resurrection-season-2
     subz languages
     subz config set defaults.min-score 60
@@ -63,6 +64,12 @@ app = typer.Typer(
 EXIT_OK = 0
 EXIT_NOT_FOUND = 1
 EXIT_ERROR = 2
+
+# Politeness defaults for every command (config network.* keys override,
+# explicit CLI flags win over both): pace requests at least 1s apart and
+# keep fetched pages in an in-memory cache for 5 minutes.
+DEFAULT_MIN_INTERVAL = 1.0
+DEFAULT_CACHE_TTL = 300.0
 
 console = Console()
 err_console = Console(stderr=True)
@@ -796,6 +803,231 @@ def auto(
 
 
 # ---------------------------------------------------------------------------
+# bulk
+# ---------------------------------------------------------------------------
+
+def _bulk_pick_pack(
+    yes: bool,
+    dry_run: bool,
+    json_out: bool,
+    map_json: Optional[str],
+) -> "Any":
+    """Build the pick_pack callback for ``subz bulk``.
+
+    Prints the ranked covering packs per group and, when the session is
+    interactive (TTY, no ``-y``, no ``--json``/``--map-json -``), asks which
+    one to use; ``0`` keeps the per-video best for that group.  Groups
+    without covering packs get the fallback notice instead.  Non-interactive
+    runs take the best-ranked pack automatically.
+    """
+    show = not json_out and map_json != "-"
+
+    def pick(title: TitleResult, group, ranked):
+        if show:
+            console.print(
+                f'[bold]"{escape(title.name)}"[/bold] - '
+                f"{len(group)} episode video(s), {len(ranked)} covering pack(s):"
+            )
+            for i, (total, version) in enumerate(ranked, 1):
+                avg = round(total / len(group))
+                release = version.releases[0] if version.releases else version.ref
+                console.print(
+                    f"  [cyan]{i}.[/cyan] [bold]\\[{avg}][/bold] {escape(release)} "
+                    f"[dim](by {escape(version.author or '?')})[/dim]"
+                )
+        if not ranked:
+            if show:
+                console.print(
+                    "  [yellow]no pack covers every episode - "
+                    "matching the episodes individually[/yellow]"
+                )
+            return None
+        interactive = (
+            not dry_run and not yes and _stdin_isatty() and not json_out and map_json != "-"
+        )
+        if interactive and len(ranked) > 1:
+            choice = _prompt_pack_choice(len(ranked))
+        else:
+            choice = 1
+        if choice == 0:
+            if show:
+                console.print("  [dim]-> per-video best for these videos[/dim]")
+            return None
+        if show:
+            console.print(
+                f"  [green]-> pack {choice}[/green] used for {len(group)} episode video(s)"
+            )
+        return ranked[choice - 1][1]
+
+    return pick
+
+
+@app.command()
+def bulk(
+    ctx: typer.Context,
+    path: Path = typer.Argument(..., help="Folder containing video files (scanned recursively)."),
+    lang: Optional[str] = typer.Option(None, "--lang", "-l", help="Subtitle language (default: config defaults.language or farsi_persian)."),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output folder for subtitles (relative: inside the videos folder; absolute: as-is; default: beside each video, or config defaults.out)."),
+    out_cwd: bool = typer.Option(False, "--out-cwd", help="Resolve a relative --out against the current directory instead of the videos folder."),
+    save_zip: Optional[bool] = typer.Option(None, "--zip/--no-zip", help="Keep the downloaded pack zips instead of extracting them (default: config defaults.zip)."),
+    lang_suffix: Optional[str] = typer.Option(None, "--lang-suffix", help="Suffix for extracted files, e.g. 'fa'."),
+    no_suffix: Optional[bool] = typer.Option(None, "--no-suffix/--with-suffix", help="Name files 'Show.S02E01.srt' instead of 'Show.S02E01.fa.srt' (default: config defaults.no-suffix)."),
+    no_packs: bool = typer.Option(False, "--no-packs", help="Skip season-pack matching entirely - plain per-video matching only."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum match score 0-100; lower-scoring videos are skipped (default: config defaults.min-score, 0 = accept every best match)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only show the plan (groups, packs, matches), download nothing."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Use the best-ranked pack for every group without asking."),
+    map_json: Optional[str] = typer.Option(None, "--map-json", metavar="[PATH]", help="Write the per-video result map as JSON to PATH ('-' = stdout; shape: results + summary)."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON."),
+) -> None:
+    """Bulk folder mode: serve whole season folders from one pack each.
+
+    Scans PATH for videos, groups them per show, and looks for ONE subtitle
+    pack covering every episode of a season (e.g. a COMPLETE season zip).
+    Every covering pack is listed ranked; pick one interactively (Enter =
+    best, 0 = per-video best) or let the best one be used with -y.  The
+    chosen pack is downloaded exactly once and each episode still gets its
+    own subtitle file extracted and renamed after the video.  Groups without
+    a covering pack - and plain movies - fall back to the per-video best
+    match automatically.
+    """
+    from .matcher import find_videos
+
+    cfg = ctx.obj.config
+    lang_slug = resolve(lang or _cfg(ctx.obj, "defaults.language", None)) or DEFAULT_LANGUAGE
+    out_value = out if out is not None else (Path(cfg["defaults.out"]) if cfg.get("defaults.out") else None)
+    min_score = int(min_score if min_score is not None else cfg.get("defaults.min-score", 0))
+    save_zip = bool(save_zip if save_zip is not None else cfg.get("defaults.zip", False))
+    lang_suffix = lang_suffix if lang_suffix is not None else (cfg.get("defaults.lang-suffix") or None)
+    no_suffix = bool(no_suffix if no_suffix is not None else cfg.get("defaults.no-suffix", False))
+    prefer_complete = not no_packs
+
+    try:
+        videos = find_videos(path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+    if not videos:
+        raise typer.Exit(_fail(f"No video files found under {path}", EXIT_NOT_FOUND))
+
+    if not json_out and map_json != "-":
+        console.print(f"[bold]{len(videos)} video file(s)[/bold] under {path}")
+        for v in videos:
+            console.print(f"  [dim]-[/dim] {v.name}")
+        note = "  [dim](dry run)[/dim]" if dry_run else ""
+        if no_packs:
+            note += "  [dim](per-video matching only)[/dim]"
+        else:
+            note += "  [dim](season-pack first)[/dim]"
+        console.print(f"[dim]language: {display_name(lang_slug)}{note}[/dim]")
+        if not dry_run and not yes and sys.stdin.isatty():
+            if not typer.confirm("Fetch and save subtitles for these files?"):
+                return
+
+    dest_dir = resolve_out(out_value, path if path.is_dir() else path.parent, out_cwd)
+    client = _client(ctx.obj)
+
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        disable=json_out or map_json == "-",
+    )
+    with progress:
+        task = progress.add_task("bulk", total=len(videos))
+
+        def on_row(row: Dict[str, Any]) -> None:
+            name = Path(row["video"]).name[:40]
+            progress.update(task, description=f"[cyan]{name}")
+
+        try:
+            rows: List[Dict[str, Any]] = client.bulk_download(
+                videos,
+                lang=lang_slug,
+                dest_dir=dest_dir,
+                save_mode="zip" if save_zip else "extract",
+                lang_suffix=lang_suffix,
+                no_suffix=no_suffix,
+                prefer_complete=prefer_complete,
+                pick_pack=_bulk_pick_pack(yes, dry_run, json_out, map_json),
+                min_score=min_score,
+                dry_run=dry_run,
+                on_row=on_row,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+        except SubZoneError as exc:
+            raise typer.Exit(_fail(str(exc), EXIT_ERROR))
+        progress.update(task, description="done")
+
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    map_payload = {
+        "path": str(path),
+        "language": lang_slug,
+        "min_score": min_score,
+        "prefer_complete": prefer_complete,
+        "dry_run": dry_run,
+        "results": rows,
+        "summary": {"total": len(rows), **counts},
+    }
+
+    if map_json == "-":
+        # machine-readable stdout: no tables, no progress noise
+        print(json.dumps(map_payload, ensure_ascii=False, indent=2))
+    elif json_out:
+        _emit(map_payload, True)
+    else:
+        pack_rows = sum(1 for row in rows if row.get("mode") == "complete-pack")
+        summary = Table(title="Bulk summary", box=box.SIMPLE_HEAVY)
+        summary.add_column("video")
+        summary.add_column("title")
+        summary.add_column("mode", style="dim")
+        summary.add_column("score", justify="right")
+        summary.add_column("status")
+        summary.add_column("saved", overflow="fold")
+        for row in rows:
+            style = {
+                "saved": "green",
+                "ok": "green",
+                "dry-run": "cyan",
+                "not found": "yellow",
+                "skipped": "yellow",
+            }.get(row["status"], "red")
+            saved = ", ".join(Path(p).name for p in row.get("saved") or []) or row.get("error", "") or "-"
+            summary.add_row(
+                Path(row["video"]).name,
+                row.get("title") or "-",
+                row.get("mode") or "-",
+                str(row.get("score", "-")),
+                f"[{style}]{row['status']}[/{style}]",
+                saved,
+            )
+        console.print(summary)
+        note = f"{pack_rows} file(s) via season pack" if pack_rows else ""
+        if map_payload["summary"].get("not found") or map_payload["summary"].get("skipped"):
+            note += (" - " if note else "") + "some videos fell back to per-video matching"
+        if note:
+            console.print(f"[dim]{note}[/dim]")
+        if map_json is not None:
+            map_path = Path(map_json).expanduser()
+            map_path.parent.mkdir(parents=True, exist_ok=True)
+            map_path.write_text(
+                json.dumps(map_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            console.print(f"[green]Wrote[/green] result map -> {map_path}")
+
+    saw_error = any(row["status"] == "error" for row in rows)
+    saw_missing = any(row["status"] in ("not found", "skipped") for row in rows)
+    if saw_error:
+        raise typer.Exit(EXIT_ERROR)
+    if saw_missing:
+        raise typer.Exit(EXIT_NOT_FOUND)
+
+
+# ---------------------------------------------------------------------------
 # popular / latest
 # ---------------------------------------------------------------------------
 
@@ -973,8 +1205,8 @@ def _callback(
     user_agent: Optional[str] = typer.Option(None, "--user-agent", help="User-Agent header (default: config network.user-agent)."),
     timeout: Optional[float] = typer.Option(None, "--timeout", help="HTTP timeout in seconds (default: config network.timeout)."),
     retries: Optional[int] = typer.Option(None, "--retries", help="Retries per request (default: config network.retries)."),
-    min_interval: Optional[float] = typer.Option(None, "--min-interval", help="Minimum seconds between HTTP requests - politeness rate limit (default: config network.min-interval, 0 = off)."),
-    cache_ttl: Optional[float] = typer.Option(None, "--cache-ttl", help="Seconds to cache fetched pages in memory (default: config network.cache-ttl, 0 = off)."),
+    min_interval: Optional[float] = typer.Option(None, "--min-interval", help="Minimum seconds between HTTP requests - politeness rate limit (default: config network.min-interval or 1s, 0 = off)."),
+    cache_ttl: Optional[float] = typer.Option(None, "--cache-ttl", help="Seconds to cache fetched pages in memory (default: config network.cache-ttl or 300s, 0 = off)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Log HTTP requests."),
 ) -> None:
     """[bold]subz[/bold] - search and download subtitles from subzone.ir."""
@@ -986,8 +1218,8 @@ def _callback(
         retries=int(retries if retries is not None else cfg.get("network.retries", 3)),
         verbose=verbose or bool(cfg.get("network.verbose", False)),
         config=cfg,
-        min_interval=float(min_interval if min_interval is not None else cfg.get("network.min-interval", 0.0)),
-        cache_ttl=float(cache_ttl if cache_ttl is not None else cfg.get("network.cache-ttl", 0.0)),
+        min_interval=float(min_interval if min_interval is not None else cfg.get("network.min-interval", DEFAULT_MIN_INTERVAL)),
+        cache_ttl=float(cache_ttl if cache_ttl is not None else cfg.get("network.cache-ttl", DEFAULT_CACHE_TTL)),
     )
 
 

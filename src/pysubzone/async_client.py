@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from .client import (
     DEFAULT_BASE_URL,
@@ -41,6 +41,7 @@ from .client import (
 )
 from .models import (
     BrowseEntry,
+    BulkPlan,
     DownloadResult,
     SubtitleDetails,
     SubtitleVersion,
@@ -123,6 +124,13 @@ class AsyncSubZoneClient:
     ) -> Tuple[TitleResult, SubtitleVersion, int]:
         return await asyncio.to_thread(self._client.auto_match, video_stem, lang)
 
+    async def plan_bulk(
+        self,
+        videos: Sequence[Union[str, Path]],
+        lang: Optional[str] = None,
+    ) -> BulkPlan:
+        return await asyncio.to_thread(self._client.plan_bulk, videos, lang)
+
     # -- downloading -------------------------------------------------------
 
     async def download(
@@ -187,6 +195,56 @@ class AsyncSubZoneClient:
             max_workers,
             on_progress,
             on_result,
+        )
+
+    async def download_pack_once(
+        self,
+        target: SubtitleRef,
+        videos: Sequence[Union[str, Path]],
+        dest_dir: Union[str, Path, None] = None,
+        save_mode: str = "extract",
+        lang_suffix: Optional[str] = None,
+        no_suffix: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> List[Tuple[Path, Union[DownloadResult, Exception]]]:
+        return await asyncio.to_thread(
+            self._client.download_pack_once,
+            target,
+            videos,
+            dest_dir,
+            save_mode,
+            lang_suffix,
+            no_suffix,
+            on_progress,
+        )
+
+    async def bulk_download(
+        self,
+        path: Union[str, Path, Sequence[Union[str, Path]]],
+        lang: Optional[str] = None,
+        dest_dir: Union[str, Path, None] = None,
+        save_mode: str = "extract",
+        lang_suffix: Optional[str] = None,
+        no_suffix: bool = False,
+        prefer_complete: bool = True,
+        pick_pack: Optional[Callable] = None,
+        min_score: int = 0,
+        dry_run: bool = False,
+        on_row: Optional[Callable] = None,
+    ) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._client.bulk_download,
+            path,
+            lang,
+            dest_dir,
+            save_mode,
+            lang_suffix,
+            no_suffix,
+            prefer_complete,
+            pick_pack,
+            min_score,
+            dry_run,
+            on_row,
         )
 
     # -- browse ------------------------------------------------------------
