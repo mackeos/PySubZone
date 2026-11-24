@@ -15,9 +15,15 @@ quit with Ctrl+Q):
     saved - destination folder is remembered for next time
 
     [AutoScreen]      the `subz auto` flow: scan a folder, match every
-                      video, dry-run or download; Enter on a matched row
-                      opens its VersionsScreen, Enter on a failed row
-                      shows why it failed
+                      video, dry-run or download; an optional
+                      "Prefer complete season pack" checkbox (remembered
+                      between sessions, default from
+                      defaults.prefer-complete) serves every episode
+                      video from one same-season pack - like the CLI's
+                      --prefer-complete - while each video still gets its
+                      own episode extracted and renamed; Enter on a
+                      matched row opens its VersionsScreen, Enter on a
+                      failed row shows why it failed
 
     [BrowseScreen]    the `subz popular` flow: popular/latest uploads,
                       media-type + page filters; Enter opens the
@@ -41,6 +47,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -51,7 +58,7 @@ from textual.widgets import (
 
 from . import __version__
 from .client import SubZoneClient
-from .config import load_tui_settings, save_tui_settings
+from .config import load_config, load_tui_settings, save_tui_settings
 from .exceptions import NoSubtitleFoundError, SubZoneError, TitleNotFoundError
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import find_videos, resolve_out
@@ -336,6 +343,7 @@ class AutoScreen(Screen):
             Button("Dry run", id="auto-dry", variant="default"),
             Button("Match & extract", id="auto-extract", variant="primary"),
             Button("Match & zip", id="auto-zip", variant="default"),
+            Checkbox("Prefer complete season pack", id="auto-prefer-complete"),
             id="auto-buttons",
         )
         yield DataTable(id="auto-table", cursor_type="row")
@@ -351,6 +359,16 @@ class AutoScreen(Screen):
             self.query_one("#auto-lang", Input).value = str(remembered["lang"])
         if remembered.get("auto_out"):
             self.query_one("#auto-out", Input).value = str(remembered["auto_out"])
+        # checkbox: last TUI choice wins, otherwise the config default
+        # (defaults.prefer-complete), otherwise off
+        checkbox = self.query_one("#auto-prefer-complete", Checkbox)
+        if "prefer_complete" in remembered:
+            checkbox.value = bool(remembered["prefer_complete"])
+        else:
+            try:
+                checkbox.value = bool(load_config().get("defaults.prefer-complete", False))
+            except Exception:  # noqa: BLE001 - a broken config must not break the screen
+                checkbox.value = False
 
     def _set_buttons(self, enabled: bool) -> None:
         for button_id in ("#auto-dry", "#auto-extract", "#auto-zip"):
@@ -380,10 +398,11 @@ class AutoScreen(Screen):
             return
         lang_value = self.query_one("#auto-lang", Input).value.strip()
         out_value = self.query_one("#auto-out", Input).value.strip()
+        prefer = self.query_one("#auto-prefer-complete", Checkbox).value
         progress = self.query_one("#auto-progress", ProgressBar)
         table = self.query_one("#auto-table", DataTable)
         self._set_buttons(False)
-        self._run(folder, lang_value, out_value, dry, mode, status, progress, table)
+        self._run(folder, lang_value, out_value, dry, mode, prefer, status, progress, table)
 
     @work(thread=True, exclusive=True)
     def _run(
@@ -393,6 +412,7 @@ class AutoScreen(Screen):
         out_value: str,
         dry: bool,
         mode: str,
+        prefer_complete: bool,
         status: Static,
         progress: ProgressBar,
         table: DataTable,
@@ -419,6 +439,20 @@ class AutoScreen(Screen):
         self.matches = []
         self.title_results = []
         total = len(videos)
+
+        # prefer-complete (the checkbox): try to serve the whole folder
+        # from one same-season pack, exactly like `subz auto
+        # --prefer-complete`.  Best-effort - a planning failure never
+        # breaks the normal per-video flow.
+        planned: Dict[Path, tuple] = {}
+        planner_note = ""
+        if prefer_complete:
+            ui(status.update, "Looking for a complete-season pack ...")
+            try:
+                planned = self.client.plan_prefer_complete(videos, lang=lang_slug)
+            except Exception as exc:  # noqa: BLE001 - planning is best-effort
+                planner_note = f"prefer-complete planning skipped: {exc}"
+
         for position, video in enumerate(videos, start=1):
             ui(status.update, f"[{position}/{total}] matching [bold]{video.name[:44]}[/bold] ...")
             row: Dict[str, Any] = {
@@ -430,8 +464,15 @@ class AutoScreen(Screen):
             }
             title_result: Optional[TitleResult] = None
             try:
-                title, best, score = self.client.best_for_file(video.stem, lang=lang_slug)
-                row.update({"title": title.name, "score": score})
+                if video in planned:
+                    # planned onto the covering pack; download() with
+                    # target_video extracts the video's own episode out of
+                    # the pack archive (v0.4.4 pack-member awareness)
+                    title, best, score = planned[video]
+                    row.update({"title": title.name, "score": score, "pack": True})
+                else:
+                    title, best, score = self.client.best_for_file(video.stem, lang=lang_slug)
+                    row.update({"title": title.name, "score": score})
                 title_result = title
                 if dry:
                     row["status"] = "dry run"
@@ -461,18 +502,24 @@ class AutoScreen(Screen):
             table.clear()
             for r in self.matches:
                 score = "-" if r["score"] is None else str(r["score"])
-                table.add_row(r["video"][:40], r["title"] or "-", score, r["status"])
+                status_text = r["status"] + (" (pack)" if r.get("pack") else "")
+                table.add_row(r["video"][:40], r["title"] or "-", score, status_text)
             table.focus()
 
         ui(fill)
         failed = sum(1 for r in self.matches if r["status"] in ("error", "not found"))
+        pack_rows = sum(1 for r in self.matches if r.get("pack"))
         if dry:
             summary = f"{total} video(s) matched (dry run)"
         else:
             saved = sum(1 for r in self.matches if r["status"] == "saved")
             summary = f"{saved}/{total} subtitle(s) saved"
+        if pack_rows:
+            summary += f", {pack_rows} via complete pack"
         if failed:
             summary += f", {failed} failed - Enter on a failed row shows why"
+        if planner_note:
+            summary += f" - [dim]{planner_note}[/dim]"
         ui(
             status.update,
             f"[green]{summary}[/green] - Enter opens a matched title, r re-scans, Esc goes back",
@@ -481,6 +528,7 @@ class AutoScreen(Screen):
             save_tui_settings({"lang": lang_value})
         if out_value:
             save_tui_settings({"auto_out": out_value})
+        save_tui_settings({"prefer_complete": prefer_complete})
         ui(self._set_buttons, True)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -656,6 +704,9 @@ class SubZoneTUI(App):
     }
     #auto-buttons Button {
         margin-right: 1;
+    }
+    #auto-buttons Checkbox {
+        margin-left: 2;
     }
     #browse-controls {
         height: auto;

@@ -49,7 +49,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import resolve_out
 from .models import DownloadResult, TitleResult
 from .parsing import parse_subtitles_url
-from .scoring import best_covering_version, rank_versions, score_version, season_info
+from .scoring import rank_versions
 
 app = typer.Typer(
     name="subz",
@@ -600,30 +600,11 @@ def auto(
     # explicitly pinned season AND episode participate; everything else
     # (movies, season folders, unmatched titles) keeps its own per-video
     # best.  A planning failure must never break the normal flow.
+    # (Shared with the TUI auto-match checkbox via plan_prefer_complete.)
     planned: Dict[Path, tuple] = {}
     if prefer_complete:
         try:
-            episode_videos = [
-                v for v in videos
-                if season_info(v.name).episodes is not None
-                and season_info(v.name).season is not None
-            ]
-            grouped: Dict[str, list] = {}
-            titles_by_slug: Dict[str, Any] = {}
-            for video in episode_videos:
-                title, _best, _score = client.best_for_file(video.stem, lang=lang_slug)
-                grouped.setdefault(title.slug, []).append(video)
-                titles_by_slug[title.slug] = title
-            for slug, group in grouped.items():
-                versions = client.title_versions(slug, lang_slug)
-                covering = best_covering_version([v.name for v in group], versions)
-                if covering is None:
-                    continue
-                _total, pack = covering
-                for video in group:
-                    s = score_version(video.name, pack)
-                    if s is not None:
-                        planned[video] = (titles_by_slug[slug], pack, s)
+            planned = client.plan_prefer_complete(videos, lang=lang_slug)
         except Exception as exc:  # noqa: BLE001 - planning is best-effort
             if not json_out and map_json != "-":
                 console.print(f"[dim]prefer-complete planning skipped: {exc}[/dim]")

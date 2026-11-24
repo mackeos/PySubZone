@@ -1743,6 +1743,13 @@ def _auto_pack_stub_client():
     downloads = []
 
     class _StubClient:
+        def plan_prefer_complete(self, videos, lang=None):
+            # the planner only calls best_for_file/title_versions, so the
+            # real SubZoneClient implementation runs against this stub
+            from pysubzone.client import SubZoneClient
+
+            return SubZoneClient.plan_prefer_complete(self, videos, lang=lang)
+
         def best_for_file(self, stem, lang=None):
             return (
                 TitleResult(name="Show", slug="show-season-2", url=""),
@@ -1846,3 +1853,171 @@ def test_cli_auto_without_flag_keeps_per_video_best(tmp_path, config_env, monkey
     for row in data["results"]:
         assert "mode" not in row
         assert row["ref"].endswith("/7")
+
+
+# ---------------------------------------------------------------------------
+# prefer-complete planner + TUI checkbox (v0.4.5)
+# ---------------------------------------------------------------------------
+
+def test_client_plan_prefer_complete_maps_group_to_one_pack(tmp_path):
+    """SubZoneClient.plan_prefer_complete (shared engine of the CLI flag and
+    the TUI checkbox): episode videos that resolve to one title are planned
+    onto a single covering pack; movies and season-folder videos are not."""
+    from pysubzone.client import SubZoneClient
+
+    stub, _downloads = _auto_pack_stub_client()
+    client = SubZoneClient()
+    # real planner code path, offline transport: point the two network
+    # methods at the stub
+    client.best_for_file = stub.best_for_file
+    client.title_versions = stub.title_versions
+
+    names = (
+        "Show.S02E01.1080p.WEBRip.mkv",
+        "Show.S02E02.1080p.WEBRip.mkv",
+        "Show.S02E05.1080p.WEBRip.mkv",
+        "Show.S02.1080p.WEBRip.mkv",  # season folder: season but no episode
+        "Some.Movie.2023.1080p.BluRay.mkv",
+    )
+    videos = [tmp_path / n for n in names]
+    planned = client.plan_prefer_complete(videos, lang="english")
+
+    # every episode is planned; the season folder and the movie are not
+    assert set(planned) == {v for v in videos if "S02E0" in v.name}
+    # the E01-E03 act pack cannot cover E05, so the COMPLETE pack (sub_id 9)
+    # wins for the whole group
+    assert {v[1].sub_id for v in planned.values()} == {"9"}
+    # planned tuples are (title, pack version, score)
+    title, version, score = planned[videos[0]]
+    assert title.slug == "show-season-2" and score > 0
+
+
+def test_client_plan_prefer_complete_returns_empty_without_cover(tmp_path):
+    """When nothing covers the whole group the planner maps nothing - the
+    normal per-video best match stays in charge."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.models import TitleResult
+
+    class _ActPackOnlyClient:
+        def best_for_file(self, stem, lang=None):
+            return TitleResult(name="Show", slug="show-season-2", url=""), None, 50
+
+        def title_versions(self, slug, lang=None):
+            return [
+                SubtitleVersion(
+                    slug="show-season-2", lang="english", sub_id="7",
+                    releases=["Show.S02E01-E02.1080p.WEBRip"], author="t",
+                ),
+            ]
+
+    client = SubZoneClient()
+    client.best_for_file = _ActPackOnlyClient().best_for_file
+    client.title_versions = _ActPackOnlyClient().title_versions
+
+    videos = [
+        tmp_path / "Show.S02E01.1080p.WEBRip.mkv",
+        tmp_path / "Show.S02E05.1080p.WEBRip.mkv",
+    ]
+    assert client.plan_prefer_complete(videos, lang="english") == {}
+
+
+def test_tui_auto_screen_prefer_complete_checkbox_flow(tmp_path, config_env):
+    """The auto screen must offer the CLI's --prefer-complete: a checkbox
+    drives the shared planner, planned rows carry a '(pack)' marker, and the
+    choice is remembered for the next session."""
+    from pysubzone.config import load_tui_settings
+    from pysubzone.models import TitleResult
+    from pysubzone.tui import AutoScreen, SubZoneTUI
+    from textual.widgets import Button, Checkbox, Input
+
+    for name in ("Show.S02E01.1080p.WEBRip.mkv", "Show.S02E05.1080p.WEBRip.mkv"):
+        (tmp_path / name).touch()
+
+    pack = SubtitleVersion(
+        slug="show", lang="farsi_persian", sub_id="9",
+        releases=["Show.Season2.COMPLETE.1080p.WEB-DL"], author="tester",
+    )
+
+    class _PackClient(_WorkingClient):
+        def plan_prefer_complete(self, videos, lang=None):
+            from pysubzone.scoring import season_info
+
+            planned = {}
+            for v in videos:
+                info = season_info(v.name)
+                if info.season == 2 and info.episodes is not None:
+                    planned[v] = (
+                        TitleResult(name="Show", slug="show", year=2024, subtitle_count=5),
+                        pack, 77,
+                    )
+            return planned
+
+    client = _PackClient()
+
+    async def scenario():
+        app = SubZoneTUI(client)
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            screen = app.screen
+            checkbox = screen.query_one("#auto-prefer-complete", Checkbox)
+            assert checkbox.value is False  # no config value, no remembered choice
+
+            screen.query_one("#auto-folder", Input).value = str(tmp_path)
+            checkbox.value = True
+            await pilot.pause()
+            screen.query_one("#auto-dry", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert screen.matches, "dry run produced no rows"
+            assert all(m.get("pack") for m in screen.matches), screen.matches
+            assert all(m["status"] == "dry run" for m in screen.matches)
+
+            # the choice survives into settings.json for the next session
+            assert load_tui_settings().get("prefer_complete") is True
+
+            # unticked: the normal per-video best match, no pack marker
+            checkbox.value = False
+            await pilot.pause()
+            screen.query_one("#auto-dry", Button).press()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert not any(m.get("pack") for m in screen.matches), screen.matches
+            assert load_tui_settings().get("prefer_complete") is False
+
+    _run_async(scenario())
+
+
+def test_tui_auto_screen_checkbox_defaults_from_config(tmp_path, config_env):
+    """With defaults.prefer-complete=true and no remembered TUI choice the
+    checkbox starts checked; an explicit remembered choice wins."""
+    from pysubzone.config import save_config, save_tui_settings
+    from pysubzone.tui import SubZoneTUI
+    from textual.widgets import Checkbox
+
+    save_config({"defaults.prefer-complete": True})
+
+    async def first():
+        app = SubZoneTUI(_FakeClient())
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            checkbox = app.screen.query_one("#auto-prefer-complete", Checkbox)
+            assert checkbox.value is True
+
+    _run_async(first())
+
+    # the remembered TUI choice overrides the config default
+    save_tui_settings({"prefer_complete": False})
+
+    async def second():
+        app = SubZoneTUI(_FakeClient())
+        async with app.run_test(size=(110, 44)) as pilot:
+            await pilot.press("ctrl+a")
+            await pilot.pause()
+            checkbox = app.screen.query_one("#auto-prefer-complete", Checkbox)
+            assert checkbox.value is False
+
+    _run_async(second())

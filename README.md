@@ -218,7 +218,7 @@ Quality and speed controls:
 
 Both options can also be set permanently in the [config file](#configuration-file) as `defaults.min-score` and `defaults.workers`.
 
-- `--prefer-complete` — opt-in batch mode: when one same-season pack covers **every** episode video in the folder (e.g. a `COMPLETE` season zip whose release lines name the folder's season), it is preferred for all of them and each video still receives its own episode extracted and renamed. Movies and videos without a pinned season/episode are never touched. Off by default; set permanently as `defaults.prefer-complete`.
+- `--prefer-complete` — opt-in batch mode: when one same-season pack covers **every** episode video in the folder (e.g. a `COMPLETE` season zip whose release lines name the folder's season), it is preferred for all of them and each video still receives its own episode extracted and renamed. Movies and videos without a pinned season/episode are never touched. Off by default; set permanently as `defaults.prefer-complete`. The TUI auto-match screen has the same mode as a **"Prefer complete season pack"** checkbox (remembered between sessions, defaulting to `defaults.prefer-complete`).
 
 For scripting, `--map-json` writes the complete per-video result map — every match, score, status and saved path, plus a summary — as JSON:
 
@@ -284,10 +284,10 @@ The TUI covers everything the CLI can do:
 1. **Search** — enter a query to see matching titles.
 2. **Versions** — select a title to browse its uploads, filter by language.
 3. **Download dialog** — pick a destination folder, optionally rename the output file in the *Save as* field, and choose to extract subtitles or keep the ZIP archive. A live progress bar tracks the download.
-4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download matching subtitles for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
+4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download matching subtitles for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. The **"Prefer complete season pack"** checkbox mirrors the CLI's `--prefer-complete`: when one same-season pack covers every episode video in the folder, all of them are served from that upload and each video still gets its own episode extracted and renamed — rows served this way are marked `(pack)` in the table. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
 5. **Browse** (`Ctrl+B`) — the `subz popular` flow: page through popular and latest uploads, filter by media type, and download directly.
 
-The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and auto-match screen come back pre-filled.
+The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and auto-match screen come back pre-filled; the auto-match checkbox state is remembered the same way.
 
 **Keyboard shortcuts**
 

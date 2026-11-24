@@ -24,7 +24,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -42,7 +42,7 @@ from .languages import DEFAULT_LANGUAGE, display_name, resolve
 from .matcher import guess_title, guess_season_episode
 from .models import DownloadResult, SubtitleDetails, SubtitleVersion, TitlePage, TitleResult
 from .parsing import parse_search, parse_subtitles_url, parse_subtitle_page, parse_title
-from .scoring import ScoreWeights, pick_best, season_info
+from .scoring import ScoreWeights, best_covering_version, pick_best, score_version, season_info
 
 DEFAULT_BASE_URL = "https://subzone.ir"
 DEFAULT_USER_AGENT = (
@@ -352,6 +352,51 @@ class SubZoneClient:
             if se:
                 return se
         return None
+
+    def plan_prefer_complete(
+        self,
+        videos: List[Path],
+        lang: Optional[str] = None,
+    ) -> Dict[Path, Tuple[TitleResult, SubtitleVersion, int]]:
+        """Map episode videos onto one same-season pack that covers them all.
+
+        Engine behind ``subz auto --prefer-complete`` and the TUI
+        auto-match checkbox: videos whose file name pins a season AND an
+        episode are grouped by their matched title; when one version's
+        release lines cover every video of a group (a COMPLETE season zip,
+        or an act pack spanning them all), each video of the group is
+        planned onto that pack - the per-video download then extracts the
+        video's own episode out of the pack archive.
+
+        Movies and videos without a pinned season/episode never appear in
+        the returned mapping and keep their normal per-video best match.
+        Raises whatever ``best_for_file``/``title_versions`` raise -
+        callers wrap this in try/except so planning stays best-effort and
+        a failure never breaks the normal flow.
+        """
+        episode_videos = [
+            v for v in videos
+            if season_info(v.name).episodes is not None
+            and season_info(v.name).season is not None
+        ]
+        grouped: Dict[str, List[Path]] = {}
+        titles_by_slug: Dict[str, Any] = {}
+        for video in episode_videos:
+            title, _best, _score = self.best_for_file(video.stem, lang=lang)
+            grouped.setdefault(title.slug, []).append(video)
+            titles_by_slug[title.slug] = title
+        planned: Dict[Path, Tuple[TitleResult, SubtitleVersion, int]] = {}
+        for slug, group in grouped.items():
+            versions = self.title_versions(slug, lang)
+            covering = best_covering_version([v.name for v in group], versions)
+            if covering is None:
+                continue
+            _total, pack = covering
+            for video in group:
+                s = score_version(video.name, pack)
+                if s is not None:
+                    planned[video] = (titles_by_slug[slug], pack, s)
+        return planned
 
     # ------------------------------------------------------------------
     # downloading
