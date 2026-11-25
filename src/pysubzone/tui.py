@@ -732,7 +732,7 @@ class BulkScreen(Screen):
         ctx = self._run_ctx
         while self._pending_groups:
             group = self._pending_groups.pop(0)
-            if group.title is None:
+            if group.title is None or group.error:
                 continue  # failed groups report their error rows directly
             if group.ranked_packs:
                 def picked(pack_version, group=group) -> None:
@@ -779,7 +779,7 @@ class BulkScreen(Screen):
             ui(progress.advance, 1)
 
         for group in plan.groups:
-            if group.title is None:
+            if group.title is None or group.error:
                 for video in group.videos:
                     add_row(
                         {
@@ -1071,7 +1071,16 @@ class BrowseScreen(Screen):
 
 
 class SubZoneTUI(App):
-    """PySubZone interactive interface."""
+    """PySubZone interactive interface.
+
+    The command palette is disabled on purpose: Textual binds ``ctrl+p``
+    to it out of the box, and this app shadows ``ctrl+p`` with its own
+    Bulk-packs shortcut.  With the palette enabled the footer would render
+    that key twice - once as our binding and once as the palette hint,
+    which resolves to our binding through ``active_bindings``.
+    """
+
+    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     #banner {

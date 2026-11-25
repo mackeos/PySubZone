@@ -22,7 +22,7 @@ Inspired by [PyAddic7](https://github.com/mackeos/PyAddic7), which works with ad
 - **Browse subtitle versions** — see the uploads available for a title, with language filtering.
 - **Download subtitles** — download a specific upload by reference or URL, or grab the newest uploads from a title page.
 - **Match video files automatically** — search for suitable subtitles based on release names, including episode number, resolution, source, and release group.
-- **Bulk folder mode** — point `subz bulk` (or the TUI's Bulk screen) at a whole season folder: one COMPLETE-season pack is chosen interactively, downloaded exactly once, and every episode still gets its own correctly named subtitle file. No pack? Episodes are matched individually instead.
+- **Bulk folder mode** — point `subz bulk` (or the TUI's Bulk screen) at a whole season folder: one COMPLETE-season pack is chosen interactively, downloaded exactly once, and every episode still gets its own correctly named subtitle file. The right site entry is picked per season, so a `Season 2` folder gets the "Show - Second Season" page even when the search lists another season first. No pack? Episodes are matched individually instead.
 - **Discover languages** — list every language the engine understands, with aliases and short codes.
 - **Script it** — every command speaks `--json`, `subz auto` can export a full result map, and the API ships type hints (`py.typed`) plus an async client.
 - **Stay polite** — requests are rate-limited (1s apart by default) and fetched pages are cached (5 minutes) to keep traffic friendly to the site; both are configurable.
@@ -227,7 +227,9 @@ For whole season folders the dedicated **bulk mode** is the better tool:
 
 ### Bulk folder mode (`subz bulk`)
 
-`subz bulk PATH` is season-pack first: the folder's videos are grouped per show, every subtitle pack covering a whole group is listed ranked, and the chosen pack is downloaded **exactly once** — each episode still gets its own subtitle file extracted from the archive and renamed after its video. One 9-episode season therefore costs one zip download and produces exactly nine subtitle files.
+`subz bulk PATH` is season-pack first: the folder's videos are grouped per show **and season**, every subtitle pack covering a whole group is listed ranked, and the chosen pack is downloaded **exactly once** — each episode still gets its own subtitle file extracted from the archive and renamed after its video. One 9-episode season therefore costs one zip download and produces exactly nine subtitle files.
+
+The site lists every season as its own entry (`Show - Second Season`, ...) and may put any of them first in the search results, so bulk mode reads the group's season — from the video file names (`S02E05`), falling back to the parent folder name (`.../Show/Season 2/`) — and targets that season's entry. Scanning a whole show folder therefore issues one search request plus one page fetch per season.
 
 ```bash
 # Plan a season folder: shows the groups, the ranked packs, downloads nothing

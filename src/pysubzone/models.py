@@ -182,12 +182,14 @@ class BulkGroupPlan:
     best_by_video: Dict[Path, Tuple["SubtitleVersion", int]] = field(default_factory=dict)
     chosen_pack: Optional["SubtitleVersion"] = None  # None -> per-video best
     pinned: bool = False                          # every video pins season AND episode
+    season: Optional[int] = None                  # group season (file name or folder name)
     error: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "title": self.title.as_dict() if self.title else None,
             "videos": [str(v) for v in self.videos],
+            "season": self.season,
             "ranked_packs": [
                 {"score": score, **version.as_dict()}
                 for score, version in self.ranked_packs

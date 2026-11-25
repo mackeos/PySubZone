@@ -101,6 +101,55 @@ def _sanitize_base_name(base_name: str) -> str:
     return cleaned or "subtitle"
 
 
+def _flatten(name: str) -> str:
+    """Letters and digits only, lower-cased (comparison key for titles)."""
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+_SEASON_TAIL_RE = re.compile(
+    r"[\s\-–—:_.]*"
+    r"(?:"
+    r"\b(?:season|فصل)[\s._-]*"
+    r"(?:first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|"
+    r"seventh|7th|eighth|8th|ninth|9th|tenth|10th|\d{1,2})\b"
+    r"|\b(?:first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|"
+    r"seventh|7th|eighth|8th|ninth|9th|tenth|10th)\b[\s._-]*season\b"
+    r"|\bs\d{1,2}\b"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_season_phrase(name: str) -> str:
+    """Entry name without its trailing season qualifier.
+
+    ``Prison Break - Second Season`` -> ``Prison Break`` so a per-season
+    site entry can be matched back to the plain show name of a video
+    folder; separators dangling after the strip are trimmed too.
+    """
+    stripped = name.strip()
+    while True:
+        candidate = _SEASON_TAIL_RE.sub("", stripped).strip(" \t-–—:_.")
+        if candidate == stripped:
+            return stripped
+        stripped = candidate
+
+
+def _season_hint(stem: str, parent_name: str = "") -> Optional[int]:
+    """Season of one video: file name first, parent folder as fallback.
+
+    ``Show.S02E05.mkv`` pins season 2 in its name; ``E05.mkv`` inside a
+    ``Season 2`` folder inherits the folder's season.  Folder names that
+    merely carry noise (``New folder (6)``) yield ``None`` - the same
+    parser that reads release names reads folder names, so word forms
+    (``Season Two``, ``Show - First Season``) work too.
+    """
+    info = season_info(stem)
+    if info.season is not None:
+        return info.season
+    return season_info(parent_name).season
+
+
 class SubZoneClient:
     """Scrape-and-download client for subzone.ir."""
 
@@ -255,16 +304,58 @@ class SubZoneClient:
             raise TitleNotFoundError(f"no title matches {query!r}")
         return results
 
-    def search_exact(self, query: str, lang: Optional[str] = None) -> TitleResult:
-        """First exact match, falling back to the closest fuzzy match."""
+    def search_exact(
+        self, query: str, lang: Optional[str] = None, season: Optional[int] = None
+    ) -> TitleResult:
+        """First exact match, falling back to the closest fuzzy match.
+
+        With *season* set (and no exact name match), the site's per-season
+        entries are understood: an entry named ``Show - Second Season``
+        whose show part equals *query* wins when the requested season is 2,
+        and a season-less generic entry is preferred over a wrong-season
+        one.  Only when nothing matches does the first search result win -
+        the previous, season-blind behaviour.
+        """
         results = self.search(query, lang=lang)
-        normalized = re.sub(r"[^a-z0-9]+", "", query.lower())
+        return self.select_title(results, query, season=season)
+
+    @staticmethod
+    def select_title(
+        results: List[TitleResult], query: str, season: Optional[int] = None
+    ) -> TitleResult:
+        """Pick the entry that answers *query* (and *season*) from *results*.
+
+        Priority: exact name match in the exact/TV sections, then a
+        season-qualified entry whose show name and season both match, then
+        a season-less entry with the query's own name (a generic page that
+        hosts every season), and finally the first result - the historic
+        fallback, kept so the never-empty contract of ``search_exact`` is
+        unchanged.
+        """
+        normalized = _flatten(query)
         for section in ("exact", "tv_series"):
             for result in results:
                 if result.section != section:
                     continue
-                cand = re.sub(r"[^a-z0-9]+", "", result.name.lower())
-                if cand == normalized:
+                if _flatten(result.name) == normalized:
+                    return result
+        if season is not None:
+            # the site splits one show into per-season entries ("Show -
+            # Second Season"); match the show part AND the season number -
+            # slugs lie (a "sequel-first-season" slug can be named "Fifth
+            # Season"), entry names do not
+            for result in results:
+                if season_info(result.name).season != season:
+                    continue
+                base = _strip_season_phrase(result.name)
+                if base and _flatten(base) == normalized:
+                    return result
+            # no per-season entry for *season*: a generic entry (no season
+            # in its name) hosts every season on one page
+            for result in results:
+                if season_info(result.name).season is not None:
+                    continue
+                if _flatten(result.name) == normalized:
                     return result
         return results[0]
 
@@ -332,7 +423,11 @@ class SubZoneClient:
         query = title_query or guess_title(filename_stem)
         if not query:
             raise TitleNotFoundError(f"cannot derive a title from {filename_stem!r}")
-        title = self.search_exact(query, lang=lang)
+        # a file that pins a season points at that season's site entry -
+        # search results put any season first, not the requested one
+        title = self.search_exact(
+            query, lang=lang, season=season_info(filename_stem).season
+        )
         versions = self.title_versions(title.slug, lang)
         if not versions:
             raise NoSubtitleFoundError(
@@ -440,15 +535,22 @@ class SubZoneClient:
         videos: Sequence[Union[str, Path]],
         lang: Optional[str] = None,
     ) -> BulkPlan:
-        """Plan a bulk folder run: group videos per title with ranked packs.
+        """Plan a bulk folder run: group videos per title+season with packs.
 
-        Videos are grouped locally by their guessed title (no network), so
-        every distinct group costs exactly ONE search + ONE title page
-        fetch - a nine-episode folder of one show is planned with two
-        requests instead of eighteen.  Each group carries every covering
-        pack ranked best-first (see :func:`~.scoring.covering_versions`)
-        plus each video's own best match, so a group without a covering
-        pack falls back to the per-video match without extra searches.
+        Videos are grouped locally by their guessed title AND season (no
+        network), so every distinct group costs one search lookup; the
+        search itself runs once per distinct title and is reused for that
+        show's every season - a four-season folder costs ONE search request
+        plus one title page per season.  The season decides WHICH site
+        entry is used: the site lists each season as its own entry (``Show
+        - Second Season``) and puts any of them first in the search
+        results, so a season-blind first-result pick downloads the wrong
+        season's subtitles.  The season comes from the video file name,
+        falling back to the parent folder name (``.../Show/Season 2/``).
+        Each group carries every covering pack ranked best-first (see
+        :func:`~.scoring.covering_versions`) plus each video's own best
+        match, so a group without a covering pack falls back to the
+        per-video match without extra searches.
 
         Videos whose names do not pin both a season and an episode (movies)
         never get packs - they form their own per-video groups.  A group
@@ -456,18 +558,42 @@ class SubZoneClient:
         ``error`` set; callers report its videos as "not found" instead of
         raising, so one unmatchable file never aborts the whole folder.
         """
-        by_query: Dict[str, List[Path]] = {}
+        by_key: Dict[Tuple[str, Optional[int]], List[Path]] = {}
         for raw in videos:
             video = Path(raw)
             query = guess_title(video.stem) or video.stem
-            by_query.setdefault(query, []).append(video)
+            by_key.setdefault((query, _season_hint(video.stem, video.parent.name)), []).append(
+                video
+            )
         groups: List[BulkGroupPlan] = []
-        for query, group in by_query.items():
+        search_cache: Dict[str, List[TitleResult]] = {}
+        search_errors: Dict[str, str] = {}
+        for (query, season), group in by_key.items():
+            if query in search_errors:  # one failed lookup serves the show's every season
+                groups.append(
+                    BulkGroupPlan(
+                        title=None, videos=group, error=search_errors[query], season=season
+                    )
+                )
+                continue
+            results = search_cache.get(query)
+            if results is None:
+                try:
+                    results = self.search(query, lang=lang)
+                except SubZoneError as exc:
+                    search_errors[query] = str(exc)
+                    groups.append(
+                        BulkGroupPlan(title=None, videos=group, error=str(exc), season=season)
+                    )
+                    continue
+                search_cache[query] = results
+            title = self.select_title(results, query, season=season)
             try:
-                title = self.search_exact(query, lang=lang)
                 versions = self.title_versions(title.slug, lang)
             except SubZoneError as exc:
-                groups.append(BulkGroupPlan(title=None, videos=group, error=str(exc)))
+                groups.append(
+                    BulkGroupPlan(title=title, videos=group, error=str(exc), season=season)
+                )
                 continue
             best_by_video: Dict[Path, Tuple[SubtitleVersion, int]] = {}
             for video in group:
@@ -487,6 +613,7 @@ class SubZoneClient:
                     ranked_packs=ranked,
                     best_by_video=best_by_video,
                     pinned=pinned,
+                    season=season,
                 )
             )
         return BulkPlan(groups=groups)
@@ -689,7 +816,10 @@ class SubZoneClient:
             emit(row)
 
         for group in plan.groups:
-            if group.title is None:
+            if group.title is None or group.error:
+                # search failed (title=None) or the title page failed
+                # (error set) - either way the group is served per-video
+                # only, and the rows carry the planning error
                 for video in group.videos:
                     row = per_video_row(video, group, "per-video")
                     row.update({"status": "not found", "error": group.error})

@@ -950,7 +950,7 @@ def test_best_for_file_forwards_weights(tmp_path, monkeypatch):
     monkeypatch.setattr("pysubzone.client.pick_best", fake_pick_best)
     monkeypatch.setattr(
         client, "search_exact",
-        lambda query, lang=None: TitleResult(name="Show", slug="show-season-1", url=""),
+        lambda query, lang=None, season=None: TitleResult(name="Show", slug="show-season-1", url=""),
     )
     monkeypatch.setattr(
         client, "title_versions", lambda slug, lang=None: _match_versions()
@@ -2460,9 +2460,9 @@ def _bulk_client(monkeypatch, versions, pack_payload=None, pack_error=None):
     title = TitleResult(name="Arcane", slug="arcane", url="")
     calls = {"search": 0, "title": 0, "fetch": 0}
 
-    def search_exact(query, lang=None):
+    def search(query, lang=None):
         calls["search"] += 1
-        return title
+        return [title]
 
     def title_versions(slug, lang=None):
         calls["title"] += 1
@@ -2474,7 +2474,7 @@ def _bulk_client(monkeypatch, versions, pack_payload=None, pack_error=None):
             raise pack_error
         return pack_payload
 
-    client.search_exact = search_exact
+    client.search = search
     client.title_versions = title_versions
     client._fetch_zip_payload = _fetch_zip_payload
     client._bulk_calls = calls
@@ -3027,3 +3027,226 @@ def test_tui_bulk_screen_falls_back_without_pack(tmp_path, config_env):
             assert client.pack_calls == []
 
     _run_async(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 0.5.1: season-aware entry selection - the site lists each season as its
+# own entry and puts any of them first in the search results, so the old
+# first-result fallback pointed every season at one wrong entry (Prison
+# Break: "Fourth Season" is the first result; a Season 2 folder got season
+# 4 and its "no pack covers" fallback).
+# ---------------------------------------------------------------------------
+
+def _prison_break_results():
+    """The live subzone.ir search results for 'prison break' (2026-11).
+
+    'Prison Break - Fourth Season' is the FIRST result, there is no generic
+    'Prison Break' entry, and the sequel entry is NAMED 'Fifth Season' while
+    its slug says 'sequel-first-season' - slugs lie, names do not.
+    """
+    from pysubzone.models import TitleResult
+
+    def entry(name, slug, year):
+        return TitleResult(
+            name=name, slug=slug, url=f"/subtitles/{slug}", year=year, section="exact",
+        )
+
+    return [
+        entry("Prison Break - Fourth Season", "prison-break-fourth-season", 2008),
+        entry("Prison Break - Fifth Season", "prison-break-sequel-first-season-2017", 2017),
+        entry("Prison Break - First Season", "prison-break-first-season", 2005),
+        entry("Prison Break - Second Season", "prison-break-second-season", 2006),
+        entry("Prison Break: The Final Break", "prison-break-the-final-break", 2009),
+        entry("Prison Break - Third Season", "prison-break-third-season", 2007),
+        entry("Prison Break (Hagoku / 破獄)", "prison-break-hagoku", 2017),
+        entry("Werewolf Game: Prison Break", "werewolf-game-prison-break", 2016),
+        entry(
+            "New York Prison Break: The Seduction of Joyce Mitchell",
+            "new-york-prison-break-the-seduction-of-joyce-mitchell", 2017,
+        ),
+        entry("Prison", "prison", 1988),
+    ]
+
+
+def test_select_title_targets_the_requested_season():
+    from pysubzone.client import SubZoneClient
+
+    pick = SubZoneClient.select_title
+    results = _prison_break_results()
+    for season, slug in (
+        (1, "prison-break-first-season"),
+        (2, "prison-break-second-season"),
+        (3, "prison-break-third-season"),
+        (4, "prison-break-fourth-season"),
+        # named 'Fifth Season', slug says first - the name wins
+        (5, "prison-break-sequel-first-season-2017"),
+    ):
+        assert pick(results, "Prison Break", season=season).slug == slug, season
+    # unknown season, or no season hint: historic first-result fallback
+    assert pick(results, "Prison Break", season=6).slug == "prison-break-fourth-season"
+    assert pick(results, "Prison Break", season=None).slug == "prison-break-fourth-season"
+    # a different show with the same words is never hijacked by the season
+    assert pick(results, "Werewolf Game", season=2).slug == "prison-break-fourth-season"
+
+
+def test_search_exact_season_reads_the_live_fixture(monkeypatch):
+    """End to end over the real search page: season 2 in, Second Season out."""
+    from types import SimpleNamespace
+
+    from pysubzone.client import SubZoneClient
+
+    client = SubZoneClient()
+    seen = {}
+
+    def fake_get(path, **kwargs):
+        seen["path"] = path
+        return SimpleNamespace(text=read("search_prison_break.html"))
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    sub = client.search_exact("Prison Break", season=2)
+    assert sub.slug == "prison-break-second-season"
+    # no season hint: the first result wins (documented fallback)
+    sub = client.search_exact("Prison Break")
+    assert sub.slug == "prison-break-fourth-season"
+    assert seen["path"] == "/subtitles/searchbytitle"
+
+
+def test_plan_bulk_targets_each_seasons_own_entry(tmp_path):
+    """THE 0.5.1 regression: a full-directory scan of a show whose site
+    entries are split per season.  One search request serves every season,
+    each group is pointed at ITS season's entry - never at the first
+    result."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.matcher import find_videos
+
+    client = SubZoneClient()
+    calls = {"search": [], "title": []}
+
+    def search(query, lang=None):
+        calls["search"].append(query)
+        return _prison_break_results()
+
+    def title_versions(slug, lang=None):
+        calls["title"].append(slug)
+        return []
+
+    client.search = search
+    client.title_versions = title_versions
+
+    root = tmp_path / "Prison Break"
+    for season in (1, 2):
+        folder = root / f"Season {season}"
+        folder.mkdir(parents=True)
+        for ep in (1, 2):
+            (folder / f"Prison.Break.S0{season}E{ep:02d}.720p.mkv").touch()
+
+    plan = client.plan_bulk(find_videos(root), lang="english")
+
+    assert calls["search"] == ["Prison Break"]  # ONE search for both seasons
+    assert sorted(calls["title"]) == [
+        "prison-break-first-season", "prison-break-second-season",
+    ]
+    assert len(plan.groups) == 2
+    by_season = {group.season: group.title.slug for group in plan.groups}
+    assert by_season[1] == "prison-break-first-season"
+    assert by_season[2] == "prison-break-second-season"
+
+
+def test_plan_bulk_inherits_season_from_folder_name(tmp_path):
+    """'Episode 5.mkv'-style names without SxxEyy take the season from
+    their parent folder: the same file stem under 'Season 1' and 'Season 2'
+    forms two groups, each pointed at its own folder's season."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.models import TitleResult
+
+    client = SubZoneClient()
+    generic = TitleResult(name="Show", slug="show", url="/subtitles/show", section="exact")
+    client.search = lambda query, lang=None: [generic]
+    client.title_versions = lambda slug, lang=None: []
+
+    s1 = tmp_path / "Show" / "Season 1"
+    s2 = tmp_path / "Show" / "Season 2"
+    s1.mkdir(parents=True)
+    s2.mkdir(parents=True)
+    (s1 / "Show.E05.1080p.mkv").touch()
+    (s2 / "Show.E05.1080p.mkv").touch()
+
+    plan = client.plan_bulk([s1 / "Show.E05.1080p.mkv", s2 / "Show.E05.1080p.mkv"])
+
+    assert len(plan.groups) == 2
+    by_season = {group.season: group.title.slug for group in plan.groups}
+    assert by_season == {1: "show", 2: "show"}
+
+
+def test_season_hint_prefers_file_name_and_ignores_noise_folders():
+    from pysubzone.client import _season_hint
+
+    assert _season_hint("Prison.Break.S02E01.720p", "Season 3") == 2  # file wins
+    assert _season_hint("Show.E05.1080p", "Season 2") == 2            # folder fallback
+    assert _season_hint("Show.E05.1080p", "Show - First Season") == 1  # word form
+    assert _season_hint("Show.E05.1080p", "New folder (6)") is None    # noise
+    assert _season_hint("The.Odyssey.2026.1080p", "Movies") is None    # movies
+
+
+def test_strip_season_phrase_understands_site_entry_names():
+    from pysubzone.client import _strip_season_phrase
+
+    assert _strip_season_phrase("Prison Break - Second Season") == "Prison Break"
+    assert _strip_season_phrase("Show: Fourth Season") == "Show"
+    assert _strip_season_phrase("Show Season 2") == "Show"
+    assert _strip_season_phrase("Show S02") == "Show"
+    assert _strip_season_phrase("Prison Break: The Final Break") == "Prison Break: The Final Break"
+    assert _strip_season_phrase("Prison Break (Hagoku / 破獄)") == "Prison Break (Hagoku / 破獄)"
+
+
+def test_plan_bulk_failed_search_serves_every_season_group_once(tmp_path):
+    """A title that cannot be searched fails each of its season groups
+    with the SAME error after exactly ONE network attempt."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import TitleNotFoundError
+
+    client = SubZoneClient()
+    attempts = []
+
+    def search(query, lang=None):
+        attempts.append(query)
+        raise TitleNotFoundError(f"no title matches {query!r}")
+
+    client.search = search
+
+    videos = [
+        tmp_path / "Ghost.Show.S01E01.720p.mkv",
+        tmp_path / "Ghost.Show.S02E01.720p.mkv",
+    ]
+    plan = client.plan_bulk(videos)
+
+    assert attempts == ["Ghost Show"]  # one attempt, not one per season
+    assert len(plan.groups) == 2
+    assert all(group.title is None and group.error for group in plan.groups)
+    assert all("no title matches" in group.error for group in plan.groups)
+
+
+def test_bulk_download_error_group_reports_the_real_error(tmp_path, monkeypatch):
+    """A group whose title page fails (title set, error set) reports the
+    planning error on its rows instead of a generic 'no matching subtitle'."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import NetworkError
+    from pysubzone.models import TitleResult
+
+    client = SubZoneClient()
+    client.search = lambda query, lang=None: [
+        TitleResult(name="Show", slug="show", url="/subtitles/show", section="exact")
+    ]
+
+    def title_versions(slug, lang=None):
+        raise NetworkError("request failed: /subtitles/show")
+
+    client.title_versions = title_versions
+
+    videos = [tmp_path / "Show.S02E01.720p.mkv"]
+    rows = client.bulk_download(videos, lang="english", prefer_complete=False)
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "not found"
+    assert "request failed" in (rows[0].get("error") or "")
