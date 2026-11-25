@@ -478,6 +478,11 @@ def filename(
     query = guess_title(stem)
     lang_slug = resolve(lang or _cfg(ctx.obj, "defaults.language", None)) or DEFAULT_LANGUAGE
     real_file = Path(file).is_file()
+    # specials context: a Specials folder (and the show folder above it)
+    # steers season-0 files to the special's own site entry; for a bare
+    # release-name argument the parent names are empty and change nothing
+    parent_name = Path(file).parent.name
+    grandparent_name = Path(file).parent.parent.name
     # Relative -o paths are created inside the video's folder; absolute paths
     # are used as-is; --out-cwd restores current-directory-relative behavior.
     source = Path(file).parent if real_file else None
@@ -494,7 +499,12 @@ def filename(
         )
 
     try:
-        title, best, score = client.best_for_file(stem, lang=lang_slug)
+        title, best, score = client.best_for_file(
+            stem,
+            lang=lang_slug,
+            parent_name=parent_name,
+            grandparent_name=grandparent_name,
+        )
         page = client.title(f"{title.slug}/{lang_slug}")
         ranked = rank_versions(stem, page.versions)[:5]
     except (NoSubtitleFoundError, TitleNotFoundError) as exc:
@@ -693,7 +703,12 @@ def auto(
                 title, best, score = planned[video]
                 row["mode"] = "complete-pack"
             else:
-                title, best, score = client.best_for_file(video.stem, lang=lang_slug)
+                title, best, score = client.best_for_file(
+                    video.stem,
+                    lang=lang_slug,
+                    parent_name=video.parent.name,
+                    grandparent_name=video.parent.parent.name,
+                )
             row.update({"title": title.name, "ref": best.ref, "score": score})
             if score < min_score:
                 row["status"] = "skipped"

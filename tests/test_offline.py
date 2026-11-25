@@ -467,7 +467,7 @@ def test_cli_filename_min_score_gate_offline(tmp_path, config_env, monkeypatch):
     from pysubzone.cli import app
 
     class _StubClient:
-        def best_for_file(self, stem, lang=None):
+        def best_for_file(self, stem, lang=None, **kwargs):
             version = SubtitleVersion(
                 slug="show-season-1", lang="farsi_persian", sub_id="7",
                 releases=["Show.S01E05.720p"], author="tester",
@@ -1177,7 +1177,7 @@ def _auto_stub_client():
     from pysubzone.models import DownloadResult, TitleResult
 
     class _StubClient:
-        def best_for_file(self, stem, lang=None):
+        def best_for_file(self, stem, lang=None, **kwargs):
             return (
                 TitleResult(name="Show", slug="show-season-1", url=""),
                 SubtitleVersion(
@@ -1755,7 +1755,7 @@ def _auto_pack_stub_client():
 
             return SubZoneClient.find_complete_packs(self, videos, lang=lang)
 
-        def best_for_file(self, stem, lang=None):
+        def best_for_file(self, stem, lang=None, **kwargs):
             return (
                 TitleResult(name="Show", slug="show-season-2", url=""),
                 SubtitleVersion(
@@ -1904,7 +1904,7 @@ def test_client_plan_prefer_complete_returns_empty_without_cover(tmp_path):
     from pysubzone.models import TitleResult
 
     class _ActPackOnlyClient:
-        def best_for_file(self, stem, lang=None):
+        def best_for_file(self, stem, lang=None, **kwargs):
             return TitleResult(name="Show", slug="show-season-2", url=""), None, 50
 
         def title_versions(self, slug, lang=None):
@@ -1939,7 +1939,7 @@ def test_tui_pack_picker_escape_falls_back_to_per_video_best(tmp_path, config_en
     async def scenario():
         app = SubZoneTUI(client)
         async with app.run_test(size=(110, 46)) as pilot:
-            await pilot.press("ctrl+p")
+            await pilot.press("ctrl+g")
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, BulkScreen)
@@ -1981,7 +1981,7 @@ def test_tui_pack_picker_second_choice_is_used(tmp_path, config_env):
     async def scenario():
         app = SubZoneTUI(client)
         async with app.run_test(size=(110, 46)) as pilot:
-            await pilot.press("ctrl+p")
+            await pilot.press("ctrl+g")
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, BulkScreen)
@@ -2927,15 +2927,32 @@ class _BulkTuiClient:
                               bytes_downloaded=10, target_video=str(video))
 
 
-def test_tui_ctrl_p_opens_bulk_screen(config_env):
+def test_tui_ctrl_g_opens_bulk_screen_and_palette_stays_on_ctrl_p(config_env):
+    """v0.5.2: Bulk packs has its own key (ctrl+g) and the command palette
+    is back on ctrl+p - v0.5.1 had disabled the palette to fix the doubled
+    footer key, which silently removed the Save-screenshot command."""
     from pysubzone.tui import BulkScreen, SubZoneTUI
 
     async def scenario():
         app = SubZoneTUI(_FakeClient())
         async with app.run_test(size=(110, 44)) as pilot:
-            await pilot.press("ctrl+p")
+            await pilot.press("ctrl+g")
             await pilot.pause()
             assert isinstance(app.screen, BulkScreen)
+            # every key is listed exactly once in the footer
+            keys = [fk.key for fk in app.screen.query("FooterKey")]
+            assert len(keys) == len(set(keys)), keys
+            assert "ctrl+g" in keys
+            # ctrl+p is listed once - as the command palette hint
+            assert keys.count("ctrl+p") == 1
+            palette_key = next(
+                fk for fk in app.screen.query("FooterKey") if fk.key == "ctrl+p"
+            )
+            assert palette_key.action == "command_palette"
+            # ctrl+p opens the command palette again
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert app.screen.__class__.__name__ == "CommandPalette"
 
     _run_async(scenario())
 
@@ -2963,7 +2980,7 @@ def test_tui_bulk_screen_dry_run_then_pack_extract(tmp_path, config_env):
     async def scenario():
         app = SubZoneTUI(client)
         async with app.run_test(size=(110, 46)) as pilot:
-            await pilot.press("ctrl+p")
+            await pilot.press("ctrl+g")
             await pilot.pause()
             assert isinstance(app.screen, BulkScreen)
             screen = app.screen
@@ -3013,7 +3030,7 @@ def test_tui_bulk_screen_falls_back_without_pack(tmp_path, config_env):
     async def scenario():
         app = SubZoneTUI(client)
         async with app.run_test(size=(110, 46)) as pilot:
-            await pilot.press("ctrl+p")
+            await pilot.press("ctrl+g")
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, BulkScreen)
@@ -3250,3 +3267,240 @@ def test_bulk_download_error_group_reports_the_real_error(tmp_path, monkeypatch)
     assert len(rows) == 1
     assert rows[0]["status"] == "not found"
     assert "request failed" in (rows[0].get("error") or "")
+
+
+# ---------------------------------------------------------------------------
+# specials (season 0) routing (v0.5.2)
+# ---------------------------------------------------------------------------
+
+def test_special_query_parts_variants():
+    """Season-0 names keep the special's own name for the site search."""
+    from pysubzone.matcher import special_query_parts
+
+    # marker form: show + the part after the season-0 marker
+    assert special_query_parts(
+        "Prison Break S00E03 The Final Break 1080p BluRay x264"
+    ) == ("Prison Break The Final Break", "Prison Break")
+    assert special_query_parts(
+        "Prison.Break.S00E03.The.Final.Break.720p.WEB-DL-NTb"
+    ) == ("Prison Break The Final Break", "Prison Break")
+    assert special_query_parts("Show Season 0 The Christmas Special")[0] == (
+        "Show The Christmas Special"
+    )
+
+    # episode-only stems inside a Specials folder borrow the show above it
+    assert special_query_parts(
+        "The Final Break", "Specials", "Prison Break"
+    ) == ("Prison Break The Final Break", "Prison Break")
+    assert special_query_parts(
+        "S00E03 The Final Break", "Specials", "Prison Break"
+    ) == ("Prison Break The Final Break", "Prison Break")
+    assert special_query_parts(
+        "E03 The Final Break", "Specials", "Prison Break"
+    ) == ("Prison Break The Final Break", "Prison Break")
+    assert special_query_parts(
+        "The Final Break S00E03", "Specials", "Prison Break"
+    ) == ("Prison Break The Final Break", "Prison Break")
+
+    # not specials: real episodes, non-special folders, un-nameable specials
+    assert special_query_parts("The Final Break", "", "") is None
+    assert special_query_parts("Show S01E02", "Specials", "Show") is None
+    assert special_query_parts("Show S00E03", "", "") is None
+    assert special_query_parts("E03", "Specials", "Prison Break") is None
+    assert special_query_parts(
+        "Prison Break S00E03", "Specials", "Prison Break"
+    ) is None
+
+
+def test_is_specials_folder_and_season_hint():
+    from pysubzone.client import _season_hint
+    from pysubzone.matcher import is_specials_folder
+
+    for name in ("Specials", "special", "Extras", "Season 0", "S00"):
+        assert is_specials_folder(name), name
+    for name in ("Season 1", "S01", "New folder (6)", "Season 10"):
+        assert not is_specials_folder(name), name
+
+    assert _season_hint("E05.mkv", "Season 2") == 2
+    assert _season_hint("The Final Break.mkv", "Specials") == 0
+    assert _season_hint("Show.S02E05.mkv", "whatever") == 2
+    assert _season_hint("The.Final.Break.mkv", "New folder (6)") is None
+
+
+def test_select_title_specials_ending_match():
+    """An entry ending with the special's own name is the show+special page."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.models import TitleResult
+
+    results = [
+        TitleResult(name="Prison Break - Fourth Season", slug="pb4",
+                    url="/subtitles/pb4", section="exact"),
+        TitleResult(name="Prison Break: The Final Break", slug="pbtfb",
+                    url="/subtitles/pbtfb", section="exact"),
+        TitleResult(name="The Final", slug="tf", url="/subtitles/tf", section="exact"),
+    ]
+    picked = SubZoneClient.select_title(results, "The Final Break", season=0)
+    assert picked.slug == "pbtfb"
+
+    # an exact name match still wins before the ending rule
+    assert SubZoneClient.select_title(
+        list(reversed(results)), "Prison Break The Final Break", season=0
+    ).slug == "pbtfb"
+
+    # the rule never applies without season 0 (first-result fallback kept)
+    assert SubZoneClient.select_title(
+        results, "The Final Break", season=None
+    ).slug == "pb4"
+
+    # a single-word query can never trigger it
+    assert SubZoneClient.select_title(results, "break", season=0).slug == "pb4"
+
+
+def test_best_for_file_routes_specials_and_falls_back(monkeypatch):
+    """'Prison Break S00E03 The Final Break' reaches the dedicated entry;
+    a special the site does not know retries the show's own search."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.exceptions import TitleNotFoundError
+    from pysubzone.matcher import flatten_name
+    from pysubzone.models import TitleResult
+
+    client = SubZoneClient()
+    queries = []
+    final_break = TitleResult(name="Prison Break: The Final Break", slug="pbtfb",
+                              url="/subtitles/pbtfb", section="exact")
+    seasons = [
+        TitleResult(name="Prison Break - Fourth Season", slug="pb4",
+                    url="/subtitles/pb4", section="exact"),
+    ]
+    special_version = SubtitleVersion(
+        slug="pbtfb", lang="farsi_persian", sub_id="1",
+        releases=["Prison Break The Final Break 2009 720p BluRay"], author="t",
+    )
+
+    def fake_search(query, lang=None):
+        queries.append(query)
+        if flatten_name(query) == flatten_name("prison break the final break"):
+            return [final_break]
+        if flatten_name(query) == flatten_name("prison break"):
+            return seasons
+        raise TitleNotFoundError(f"no title matches {query!r}")
+
+    monkeypatch.setattr(client, "search", fake_search)
+    monkeypatch.setattr(
+        client, "title_versions", lambda slug, lang=None: [special_version]
+    )
+
+    title, _best, _score = client.best_for_file(
+        "Prison Break S00E03 The Final Break 1080p",
+        parent_name="Specials",
+        grandparent_name="Prison Break",
+    )
+    assert title.slug == "pbtfb"
+    assert queries == ["Prison Break The Final Break"]
+
+    # unknown special: the composed query misses, the show search answers
+    queries.clear()
+    title, _best, _score = client.best_for_file(
+        "Prison Break S00E03 Mystery Special 1080p"
+    )
+    assert title.slug == "pb4"
+    assert queries == ["Prison Break Mystery Special", "Prison Break"]
+
+
+def test_plan_bulk_groups_specials_by_own_name(tmp_path, monkeypatch):
+    """A specials file forms its own group under its own query and lands on
+    the dedicated entry; a same-show season folder keeps the season pick."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.matcher import flatten_name
+    from pysubzone.models import TitleResult
+
+    final_break = TitleResult(name="Prison Break: The Final Break", slug="pbtfb",
+                              url="/subtitles/pbtfb", section="exact")
+    seasons = [
+        TitleResult(name="Prison Break - Fourth Season", slug="pb4",
+                    url="/subtitles/pb4", section="exact"),
+        TitleResult(name="Prison Break - First Season", slug="pb1",
+                    url="/subtitles/pb1", section="exact"),
+    ]
+    client = SubZoneClient()
+    queries = []
+
+    def fake_search(query, lang=None):
+        queries.append(query)
+        if flatten_name(query) == flatten_name("prison break the final break"):
+            return [final_break]
+        if flatten_name(query) == flatten_name("prison break"):
+            return seasons
+        from pysubzone.exceptions import TitleNotFoundError
+
+        raise TitleNotFoundError(f"no title matches {query!r}")
+
+    def fake_title_versions(slug, lang=None):
+        if slug == "pbtfb":
+            return [SubtitleVersion(
+                slug="pbtfb", lang="farsi_persian", sub_id="1",
+                releases=["Prison Break The Final Break 2009 720p BluRay"],
+                author="t",
+            )]
+        return [SubtitleVersion(
+            slug=slug, lang="farsi_persian", sub_id="2",
+            releases=["Prison.Break.S01.COMPLETE.720p.BluRay-x264"], author="t",
+        )]
+
+    monkeypatch.setattr(client, "search", fake_search)
+    monkeypatch.setattr(client, "title_versions", fake_title_versions)
+
+    videos = [
+        tmp_path / "Prison Break" / "Specials" / "Prison Break S00E03 The Final Break.mkv",
+        tmp_path / "Prison Break" / "Season 1" / "Prison Break S01E01.mkv",
+        tmp_path / "Prison Break" / "Season 1" / "Prison Break S01E02.mkv",
+    ]
+    for video in videos:
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.touch()
+
+    plan = client.plan_bulk(videos, lang="farsi_persian")
+
+    by_slug = {group.title.slug: group for group in plan.groups if group.title}
+    assert set(by_slug) == {"pbtfb", "pb1"}  # NOT the Fourth Season entry
+    assert by_slug["pbtfb"].season == 0
+    assert by_slug["pb1"].season == 1
+    assert len(by_slug["pb1"].videos) == 2
+    # one search per distinct query: the special's own + the show's
+    assert queries == ["Prison Break The Final Break", "Prison Break"]
+
+
+def test_plan_bulk_unknown_special_retries_show_search(tmp_path, monkeypatch):
+    """A special the site does not know falls back to the show's search
+    instead of erroring the group out."""
+    from pysubzone.client import SubZoneClient
+    from pysubzone.matcher import flatten_name
+    from pysubzone.models import TitleResult
+
+    seasons = [
+        TitleResult(name="Show - First Season", slug="show1",
+                    url="/subtitles/show1", section="exact"),
+    ]
+    client = SubZoneClient()
+    queries = []
+
+    def fake_search(query, lang=None):
+        queries.append(query)
+        if flatten_name(query) == flatten_name("show"):
+            return seasons
+        from pysubzone.exceptions import TitleNotFoundError
+
+        raise TitleNotFoundError(f"no title matches {query!r}")
+
+    monkeypatch.setattr(client, "search", fake_search)
+    monkeypatch.setattr(client, "title_versions", lambda slug, lang=None: [])
+
+    video = tmp_path / "Show" / "Specials" / "Show S00E01 Never Heard Of It.mkv"
+    video.parent.mkdir(parents=True)
+    video.touch()
+
+    plan = client.plan_bulk([video], lang="english")
+    assert queries == ["Show Never Heard Of It", "Show"]
+    assert len(plan.groups) == 1
+    group = plan.groups[0]
+    assert group.title is not None and group.title.slug == "show1"

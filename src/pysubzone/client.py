@@ -39,7 +39,13 @@ from .exceptions import (
     TitleNotFoundError,
 )
 from .languages import DEFAULT_LANGUAGE, display_name, resolve
-from .matcher import guess_title, guess_season_episode
+from .matcher import (
+    flatten_name,
+    guess_title,
+    guess_season_episode,
+    is_specials_folder,
+    special_query_parts,
+)
 from .models import (
     BulkGroupPlan,
     BulkPlan,
@@ -101,9 +107,7 @@ def _sanitize_base_name(base_name: str) -> str:
     return cleaned or "subtitle"
 
 
-def _flatten(name: str) -> str:
-    """Letters and digits only, lower-cased (comparison key for titles)."""
-    return re.sub(r"[^a-z0-9]+", "", name.lower())
+_flatten = flatten_name  # historical name, see matcher.flatten_name
 
 
 _SEASON_TAIL_RE = re.compile(
@@ -139,14 +143,18 @@ def _season_hint(stem: str, parent_name: str = "") -> Optional[int]:
     """Season of one video: file name first, parent folder as fallback.
 
     ``Show.S02E05.mkv`` pins season 2 in its name; ``E05.mkv`` inside a
-    ``Season 2`` folder inherits the folder's season.  Folder names that
-    merely carry noise (``New folder (6)``) yield ``None`` - the same
-    parser that reads release names reads folder names, so word forms
-    (``Season Two``, ``Show - First Season``) work too.
+    ``Season 2`` folder inherits the folder's season.  A ``Specials``
+    folder means season 0 - a specials file is never an episode of the
+    show's numbered seasons.  Folder names that merely carry noise
+    (``New folder (6)``) yield ``None`` - the same parser that reads
+    release names reads folder names, so word forms (``Season Two``,
+    ``Show - First Season``) work too.
     """
     info = season_info(stem)
     if info.season is not None:
         return info.season
+    if is_specials_folder(parent_name):
+        return 0
     return season_info(parent_name).season
 
 
@@ -325,12 +333,13 @@ class SubZoneClient:
     ) -> TitleResult:
         """Pick the entry that answers *query* (and *season*) from *results*.
 
-        Priority: exact name match in the exact/TV sections, then a
-        season-qualified entry whose show name and season both match, then
-        a season-less entry with the query's own name (a generic page that
-        hosts every season), and finally the first result - the historic
-        fallback, kept so the never-empty contract of ``search_exact`` is
-        unchanged.
+        Priority: exact name match in the exact/TV sections, then - for
+        season 0 (specials) - an entry whose name ends with the special's
+        own name, then a season-qualified entry whose show name and season
+        both match, then a season-less entry with the query's own name (a
+        generic page that hosts every season), and finally the first
+        result - the historic fallback, kept so the never-empty contract
+        of ``search_exact`` is unchanged.
         """
         normalized = _flatten(query)
         for section in ("exact", "tv_series"):
@@ -339,6 +348,18 @@ class SubZoneClient:
                     continue
                 if _flatten(result.name) == normalized:
                     return result
+        if season == 0:
+            # specials live on their own entry ("Prison Break: The Final
+            # Break"); when the query is the special's own name and no
+            # entry carries it exactly, the entry ENDING with the name is
+            # the show+special page ("The Final Break" -> "Prison Break:
+            # The Final Break").  Multi-word queries only, so a stray
+            # single token cannot hijack the pick.
+            if len(query.split()) >= 2:
+                for result in results:
+                    flat = _flatten(result.name)
+                    if flat and flat != normalized and flat.endswith(normalized):
+                        return result
         if season is not None:
             # the site splits one show into per-season entries ("Show -
             # Second Season"); match the show part AND the season number -
@@ -411,6 +432,9 @@ class SubZoneClient:
         lang: Optional[str] = DEFAULT_LANGUAGE,
         title_query: Optional[str] = None,
         weights: Optional[ScoreWeights] = None,
+        *,
+        parent_name: str = "",
+        grandparent_name: str = "",
     ) -> Tuple[TitleResult, SubtitleVersion, int]:
         """Find the best subtitle version for a video release name.
 
@@ -419,15 +443,42 @@ class SubZoneClient:
         unless *title_query* is given), then versions are scored by release
         similarity (episode numbers must agree).  *weights* optionally
         tunes the scoring via :class:`~.scoring.ScoreWeights`.
+
+        Season-0 (specials) names are routed to the special's own site
+        entry: ``Prison Break S00E03 The Final Break`` searches ``Prison
+        Break The Final Break`` - the part after the ``S00Eyy`` marker is
+        the special's actual name - and lands on the dedicated ``Prison
+        Break: The Final Break`` entry instead of falling into a numbered
+        season.  An episode-only stem inside a ``Specials`` folder (its
+        *parent_name*) composes the query the same way, taking the show
+        name from the folder above.  A special the site does not know
+        falls back to the show's own search instead of erroring.
         """
-        query = title_query or guess_title(filename_stem)
+        special = (
+            special_query_parts(filename_stem, parent_name, grandparent_name)
+            if title_query is None
+            else None
+        )
+        query = (
+            title_query
+            or (special[0] if special else None)
+            or guess_title(filename_stem)
+        )
         if not query:
             raise TitleNotFoundError(f"cannot derive a title from {filename_stem!r}")
         # a file that pins a season points at that season's site entry -
         # search results put any season first, not the requested one
-        title = self.search_exact(
-            query, lang=lang, season=season_info(filename_stem).season
-        )
+        season = season_info(filename_stem).season
+        if season is None and special is not None:
+            season = _season_hint(filename_stem, parent_name)
+        try:
+            title = self.search_exact(query, lang=lang, season=season)
+        except TitleNotFoundError:
+            # unknown special: retry the show's own search before giving up
+            if special is not None and special[1] and _flatten(special[1]) != _flatten(query):
+                title = self.search_exact(special[1], lang=lang, season=season)
+            else:
+                raise
         versions = self.title_versions(title.slug, lang)
         if not versions:
             raise NoSubtitleFoundError(
@@ -553,22 +604,39 @@ class SubZoneClient:
         per-video match without extra searches.
 
         Videos whose names do not pin both a season and an episode (movies)
-        never get packs - they form their own per-video groups.  A group
-        whose title search fails comes back with ``title=None`` and
-        ``error`` set; callers report its videos as "not found" instead of
-        raising, so one unmatchable file never aborts the whole folder.
+        never get packs - they form their own per-video groups.  Season-0
+        (specials) videos form their own groups under the special's own
+        query (``Prison Break S00E03 The Final Break`` -> "Prison Break The
+        Final Break"), so they land on the dedicated entry instead of a
+        numbered season; an episode-only stem inside a ``Specials`` folder
+        composes the query from the folder above it.  A group whose title
+        search fails comes back with ``title=None`` and ``error`` set;
+        callers report its videos as "not found" instead of raising, so
+        one unmatchable file never aborts the whole folder.  An unknown
+        special retries the show's own search before the group is given up.
         """
         by_key: Dict[Tuple[str, Optional[int]], List[Path]] = {}
+        special_fallback: Dict[Tuple[str, Optional[int]], str] = {}
         for raw in videos:
             video = Path(raw)
-            query = guess_title(video.stem) or video.stem
-            by_key.setdefault((query, _season_hint(video.stem, video.parent.name)), []).append(
-                video
+            special = special_query_parts(
+                video.stem, video.parent.name, video.parent.parent.name
             )
+            query = (
+                (special[0] if special else None)
+                or guess_title(video.stem)
+                or video.stem
+            )
+            key = (query, _season_hint(video.stem, video.parent.name))
+            by_key.setdefault(key, []).append(video)
+            if special and special[1]:
+                special_fallback[key] = special[1]
         groups: List[BulkGroupPlan] = []
         search_cache: Dict[str, List[TitleResult]] = {}
+        select_queries: Dict[str, str] = {}
         search_errors: Dict[str, str] = {}
         for (query, season), group in by_key.items():
+            fallback_query = special_fallback.get((query, season))
             if query in search_errors:  # one failed lookup serves the show's every season
                 groups.append(
                     BulkGroupPlan(
@@ -580,14 +648,31 @@ class SubZoneClient:
             if results is None:
                 try:
                     results = self.search(query, lang=lang)
+                    select_queries[query] = query
                 except SubZoneError as exc:
-                    search_errors[query] = str(exc)
-                    groups.append(
-                        BulkGroupPlan(title=None, videos=group, error=str(exc), season=season)
-                    )
-                    continue
+                    # an unknown special retries the show's own search
+                    # before the whole group is given up
+                    retried = False
+                    if (
+                        fallback_query
+                        and _flatten(fallback_query) != _flatten(query)
+                    ):
+                        try:
+                            results = self.search(fallback_query, lang=lang)
+                            select_queries[query] = fallback_query
+                            retried = True
+                        except SubZoneError:
+                            pass
+                    if not retried:
+                        search_errors[query] = str(exc)
+                        groups.append(
+                            BulkGroupPlan(title=None, videos=group, error=str(exc), season=season)
+                        )
+                        continue
                 search_cache[query] = results
-            title = self.select_title(results, query, season=season)
+            title = self.select_title(
+                results, select_queries.get(query, query), season=season
+            )
             try:
                 versions = self.title_versions(title.slug, lang)
             except SubZoneError as exc:

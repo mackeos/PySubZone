@@ -23,6 +23,7 @@ Inspired by [PyAddic7](https://github.com/mackeos/PyAddic7), which works with ad
 - **Download subtitles** — download a specific upload by reference or URL, or grab the newest uploads from a title page.
 - **Match video files automatically** — search for suitable subtitles based on release names, including episode number, resolution, source, and release group.
 - **Bulk folder mode** — point `subz bulk` (or the TUI's Bulk screen) at a whole season folder: one COMPLETE-season pack is chosen interactively, downloaded exactly once, and every episode still gets its own correctly named subtitle file. The right site entry is picked per season, so a `Season 2` folder gets the "Show - Second Season" page even when the search lists another season first. No pack? Episodes are matched individually instead.
+- **Specials land on their own entry** — a season-0 file (`Show S00E03 The Final Break ...`) or a named video inside a `Specials` folder is matched against the special's dedicated site entry (`Prison Break: The Final Break`), not against a numbered season; a special the site does not know falls back to the show's own search.
 - **Discover languages** — list every language the engine understands, with aliases and short codes.
 - **Script it** — every command speaks `--json`, `subz auto` can export a full result map, and the API ships type hints (`py.typed`) plus an async client.
 - **Stay polite** — requests are rate-limited (1s apart by default) and fetched pages are cached (5 minutes) to keep traffic friendly to the site; both are configurable.
@@ -312,8 +313,9 @@ The TUI covers everything the CLI can do:
 2. **Versions** — select a title to browse its uploads, filter by language.
 3. **Download dialog** — pick a destination folder, optionally rename the output file in the *Save as* field, and choose to extract subtitles or keep the ZIP archive. A live progress bar tracks the download.
 4. **Auto-match** (`Ctrl+A`, works from any screen) — the `subz auto` flow: enter a folder, then dry-run or download the per-video best matching subtitle for every video it contains. A relative output folder (e.g. `subs`) is created inside the videos folder, just like `subz auto -o`. Selecting a matched row opens that title's version list so you can pick another upload; selecting a failed row shows why it failed.
-5. **Bulk packs** (`Ctrl+P`, works from any screen) — the `subz bulk` flow: season-pack first bulk mode for whole folders. Videos are grouped per show, every covering COMPLETE-season pack is listed in a ranked picker screen (fit score, release name, uploader) — Enter uses the selected pack for the whole group, Esc keeps the per-video best — the pack is downloaded exactly once, and each episode gets its own subtitle extracted and renamed. Groups without a covering pack (and movies) fall back to the per-video best automatically, with a note in the status line.
+5. **Bulk packs** (`Ctrl+G`, works from any screen) — the `subz bulk` flow: season-pack first bulk mode for whole folders. Videos are grouped per show, every covering COMPLETE-season pack is listed in a ranked picker screen (fit score, release name, uploader) — Enter uses the selected pack for the whole group, Esc keeps the per-video best — the pack is downloaded exactly once, and each episode gets its own subtitle extracted and renamed. Groups without a covering pack (and movies) fall back to the per-video best automatically, with a note in the status line. Specials (season 0, e.g. `Prison Break S00E03 The Final Break`) are matched against their own site entry instead of a numbered season.
 6. **Browse** (`Ctrl+B`) — the `subz popular` flow: page through popular and latest uploads, filter by media type, and download directly.
+7. **Command palette** (`Ctrl+P`) — Textual's command palette; it includes *Save screenshot*, which writes the current screen as an SVG.
 
 The last destination folder and language filter are remembered between sessions (stored as `settings.json` next to the config file), so the download dialog and the auto/bulk screens come back pre-filled.
 
@@ -323,7 +325,8 @@ The last destination folder and language filter are remembered between sessions 
 |---|---|
 | `Ctrl+S` | Search screen |
 | `Ctrl+A` | Auto-match screen (works everywhere, even while typing) |
-| `Ctrl+P` | Bulk packs screen (works everywhere, even while typing) |
+| `Ctrl+G` | Bulk packs screen (works everywhere, even while typing) |
+| `Ctrl+P` | Command palette (Save screenshot and friends) |
 | `Ctrl+B` | Browse screen |
 | `Esc` | Go back or close the current view |
 | `r` | Refresh versions / re-scan the folder |

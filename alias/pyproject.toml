@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subf2m"
-version = "0.5.1"
+version = "0.5.2"
 description = "Compatibility alias: installs pysubzone, the Python API/CLI/TUI subtitle downloader for subzone.ir (Subf2m subtitle database engine)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,7 +36,7 @@ classifiers = [
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "pysubzone>=0.5.1",
+    "pysubzone>=0.5.2",
 ]
 
 [project.urls]

@@ -515,7 +515,12 @@ class AutoScreen(Screen):
             }
             title_result: Optional[TitleResult] = None
             try:
-                title, best, score = self.client.best_for_file(video.stem, lang=lang_slug)
+                title, best, score = self.client.best_for_file(
+                    video.stem,
+                    lang=lang_slug,
+                    parent_name=video.parent.name,
+                    grandparent_name=video.parent.parent.name,
+                )
                 row.update({"title": title.name, "score": score})
                 title_result = title
                 if dry:
@@ -1073,14 +1078,14 @@ class BrowseScreen(Screen):
 class SubZoneTUI(App):
     """PySubZone interactive interface.
 
-    The command palette is disabled on purpose: Textual binds ``ctrl+p``
-    to it out of the box, and this app shadows ``ctrl+p`` with its own
-    Bulk-packs shortcut.  With the palette enabled the footer would render
-    that key twice - once as our binding and once as the palette hint,
-    which resolves to our binding through ``active_bindings``.
+    Bulk packs lives on ``ctrl+g`` so ``ctrl+p`` stays Textual's command
+    palette - the palette carries the Save-screenshot command.  When Bulk
+    packs shadowed ``ctrl+p`` (v0.4.x - v0.5.0) the footer rendered that
+    key twice and the palette was unreachable; v0.5.1 disabled the palette
+    to kill the duplicate footer key, which also took the screenshot
+    command away - v0.5.2 gives the app binding its own key instead, so
+    the footer lists every key exactly once and the palette is back.
     """
-
-    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
     #banner {
@@ -1171,7 +1176,10 @@ class SubZoneTUI(App):
         # binding (cursor-home) - Auto-match must work from the search screen
         # even while the query field has focus
         Binding("ctrl+a", "show_auto", "Auto-match", priority=True),
-        Binding("ctrl+p", "show_bulk", "Bulk packs", priority=True),
+        # ctrl+g, NOT ctrl+p: ctrl+p is Textual's command palette (it holds
+        # the Save-screenshot command) and a shared key rendered twice in
+        # the footer - see the class docstring
+        Binding("ctrl+g", "show_bulk", "Bulk packs", priority=True),
     ]
 
     def __init__(self, client: SubZoneClient) -> None:
